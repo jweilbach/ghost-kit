@@ -1,0 +1,562 @@
+// DEPRECATED (sunsetting): forged rites route through forge-ritual → rite-cadence backend/frontend waves; this workflow remains for ad-hoc ghost sets only.
+export const meta = {
+  name: 'ghost-lane',
+  description: 'DEPRECATED (sunsetting): forged rites route through forge-ritual → rite-cadence backend/frontend waves; this workflow remains for ad-hoc ghost sets only. Run ONE ghost through the full lifecycle (plan → plan-review gate → implement+test → code-review gate → ship/STOP → human merge gate). The Workflow owns every transition via structured agent() gates that loop or ESCALATE to the human; reviews run the FULL /panel (all appropriate lenses) each cycle. Default mode: a dedicated ghost/<short> branch in the main tree, ships a PR via the wrap-up/qa skills. Owns-tree mode (owns_tree+no_ship, used by the extermination set orchestrator): NATIVE in-session stages on a pre-provisioned worktree — the commence-haunt/review-haunt skills are NOT invoked — commits without pushing so the orchestrator can collate onto one integration branch.',
+  phases: [
+    { title: 'setup' },
+    { title: 'plan' },
+    { title: 'plan-review' },
+    { title: 'implement' },
+    { title: 'commit' },
+    { title: 'code-review' },
+    { title: 'ship' },
+    { title: 'qa' },
+    { title: 'handoff' },
+  ],
+}
+
+// ── Rendered repo config (tokens substituted from .ghost/config.json by ghost-kit's
+//    render-workflows.sh — every token lives ONLY inside a string literal) ──────────
+const REPO           = '__CFG_repo__'
+const PLUGIN_VERSION = '__CFG_plugin_version__'
+const KEY_VAR        = '__CFG_key_var__'        // talisman env var name in the env file
+const ENV_FILE       = '__CFG_env_file__'       // repo-relative env file holding the talisman
+// auth.prod.org_id: binds the key to one Coven. When set (and only then) the talisman falls back to
+// the per-user GHOST_HUNTING_API_KEY__<ORG8> line /ghost-onboard writes — same order as PHASE0.md.
+const ORG_ID         = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test('__CFG_org_id__') ? '__CFG_org_id__' : ''
+const USER_KEY_FALLBACK = ORG_ID ? `; [ -z "$TALISMAN" ] && TALISMAN=$(awk -F= '/^GHOST_HUNTING_API_KEY__${ORG_ID.slice(0, 8).toUpperCase()}=/{sub(/^[^=]*=/, ""); print}' "\${XDG_CONFIG_HOME:-$HOME/.config}/ghost-hunting/.env" | tr -d '"'\\''[:space:]')` : ''
+const ISOLATION_MODE = '__CFG_isolation_mode__' // 'none' = repo has no isolation primitives
+const DB_SCRIPT      = '__CFG_db_script__'      // repo-relative scratch-DB script (create/url/drop/reap)
+const COMMIT_SCRIPT  = '__CFG_commit_script__'  // repo-relative secret-scanned no-push commit primitive
+const MIGRATION_GATE = '__CFG_migration_gate__' // repo-relative migration drift gate; empty = none
+const DB_PREFIX      = '__CFG_db_prefix__'      // scratch-DB name prefix (e.g. myapp)
+const TEST_BACKEND   = '__CFG_test_backend__'   // full backend-suite command, run from the repo root
+const TEST_FRONTEND  = '__CFG_test_frontend__'  // full frontend-suite command; empty = none
+const TEST_ALL       = '__CFG_test_all__'       // full whole-suite command; empty = none
+const BROWSER_TOOL   = '__CFG_browser_tool__'   // 'none'/empty = no browser verification available
+const HAS_BROWSER    = !!BROWSER_TOOL && BROWSER_TOOL !== 'none'
+
+// ── Args (normalized — may arrive as object, JSON string, or undefined) ──
+let A = args
+if (typeof A === 'string') { try { A = JSON.parse(A) } catch (e) { A = {} } }
+if (!A || typeof A !== 'object') A = {}
+const GHOST_ID = A.ghost_id
+if (!GHOST_ID) throw new Error('ghost-lane requires args.ghost_id (got: ' + JSON.stringify(args) + ')')
+const BASE = A.base_branch || 'main'
+const API = A.api_base || '__CFG_api_base__'
+// Product QA séance — where qa-pr drops the verification tree (passed explicitly so qa-pr never
+// auto-detects). May render EMPTY — the qa stage guards on it and skips with a log instead of crashing.
+const QA_SEANCE = A.qa_seance_id || '__CFG_qa_seance_id__'
+const PLAN_CAP = A.plan_review_cap || 5
+const CODE_CAP = A.code_review_cap || 5
+// Unattended overnight mode (user-authorized 2026-06-14): skip the Binding-Circle
+// request at handoff so the orchestrator can exorcise the ghost the moment its PR
+// merges (dependents unblock without a human approval gate). /panel review + CI still
+// gate every merge; merged PRs + purgatory QA wisps are the review surface.
+const NO_BINDING_CIRCLE = A.no_binding_circle === true
+// "Escalate to me" — the human Hunter to hand off to. May render EMPTY — every handoff-hunter
+// call below guards on it and degrades to EVP + request-approval with a clear note.
+const HUMAN_HUNTER = A.human_hunter_id || '__CFG_human_hunter_id__'
+const SHORT = String(GHOST_ID).slice(0, 8)
+const BRANCH = `ghost/${SHORT}`
+const RUN_ARTIFACT = `.claude/state/haunt-cycle/runs/${GHOST_ID}.json`
+
+// ── Phase 2 worktree mode (extermination per-ghost lane) ────────────────
+// OWNS_TREE: an orchestrator already created the worktree + branch; this lane must NOT
+//   create/switch branches, tolerates a dirty tree, isolates the test DB per ghost,
+//   gates migrations, and commits (no push) so commits can be collated.
+// NO_SHIP: stop after code-review PASS — skip ship/qa/handoff (the orchestrator ships once).
+// Default mode (neither flag) is the unchanged single-ghost PR path.
+const OWNS_TREE = !!A.owns_tree
+const NO_SHIP   = !!A.no_ship
+// MECH_ONLY: smoke/dry-run — auto-PASS the review gates (skip the /panel agents) so a run
+// exercises the worktree/DB/commit/guard mechanics without panel cost or nondeterminism.
+// Falsy in every real run → the gates behave exactly as before.
+const MECH_ONLY = !!A.mech_only
+// FRONTEND_OK: this ghost may touch frontend/ — the owns-tree prompts drop the backend-only
+// framing and the independent verifier also runs the frontend suite when the committed diff
+// touches frontend/. Flag off ⇒ every prompt below is byte-identical to before.
+const FRONTEND_OK = !!A.frontend_ok
+// BASELINE_RED: test ids already failing on the untouched integration base (extermination's baseline
+// stage). The independent verifier treats these as pre-existing — only a test NOT in this list that
+// fails counts as a regression this ghost caused. Empty in default (non-set) runs.
+const BASELINE_RED = Array.isArray(A.baseline_red) ? A.baseline_red : []
+// In owns-tree mode the lane runs IN-SESSION (no claude -p), so the subagent's $CLAUDE_PROJECT_DIR
+// and CWD point at MAIN, not the worktree. The orchestrator passes the absolute worktree path here
+// and EVERY owns-tree file/git/script ref below uses ${WORKTREE} (never $CLAUDE_PROJECT_DIR).
+const WORKTREE  = A.worktree_path || ''
+if (OWNS_TREE && !WORKTREE) throw new Error('ghost-lane owns_tree mode requires args.worktree_path (got: ' + JSON.stringify(args) + ')')
+
+// ── Runtime config guards (a token may render empty — degrade loudly, never crash) ──
+if (OWNS_TREE && (!DB_SCRIPT || !COMMIT_SCRIPT || !DB_PREFIX)) {
+  log(`ABORT: owns_tree mode requires the repo's isolation primitives in .ghost/config.json — db_script="${DB_SCRIPT}", commit_script="${COMMIT_SCRIPT}", db_prefix="${DB_PREFIX}" (isolation.mode="${ISOLATION_MODE}"). Configure isolation or run the default (non-owns-tree) lane.`)
+  return { aborted: true, reason: 'missing-isolation-config' }
+}
+if (OWNS_TREE && !TEST_BACKEND) log('WARN: no tests.backend command configured (.ghost/config.json) — the owns-tree suite run and the independent verifier are SKIPPED; the test dimension rests on targeted checks + review only.')
+if (OWNS_TREE && !MIGRATION_GATE) log('note: no isolation.migration_gate configured — migration-gate steps are skipped in this lane.')
+
+// Filled by SETUP from the live worktree in owns-tree mode; stay as-is otherwise.
+let GHOST_BRANCH  = BRANCH
+let PRE_GHOST_SHA = ''
+let DB_SLUG       = ''
+let GHOST_SHA     = ''
+// owns-tree main-checkout guard: derived in SETUP from the worktree's git-common-dir (tamper-proof).
+let MAIN_ROOT     = ''
+let MAIN_HEAD_SHA = ''
+let MAIN_BRANCH   = ''
+
+// Project root for shell refs: the worktree in owns-tree mode, else the literal $CLAUDE_PROJECT_DIR
+// shell var (so default-mode prompts stay byte-identical to today).
+const ROOTREF = OWNS_TREE ? WORKTREE : '$(git rev-parse --show-toplevel)'
+
+const CREDS = `## Credentials & context
+- Read the talisman: TALISMAN=$(awk -F= '/^${KEY_VAR}=/{print $2}' "${ROOTREF}/${ENV_FILE}" | tr -d '"'\\''[:space:]')${USER_KEY_FALLBACK}; AUTH="Authorization: Bearer $TALISMAN"; API="${API}"
+- Client header — set once, then pass -H "$XGC" on EVERY curl to $API alongside -H "$AUTH": XGC="X-Ghost-Client: plugin/${PLUGIN_VERSION} repo/${REPO} wf/$(jq -r '.bundle // empty' "${ROOTREF}/.ghost/sync-state.json" 2>/dev/null)"
+- Ghost ID: ${GHOST_ID}  ·  short: ${SHORT}  ·  branch: ${BRANCH}  ·  base: ${BASE}
+- You are running INSIDE the haunt-cycle Workflow. The Workflow owns the ghost's pipeline_stage/status transitions — you only do what this stage says.
+- EVP field is "content" not "body". The hunters endpoint returns {"items":[...]}. Context PUT REPLACES the whole context_payload — to change agent_notes, GET /context, take .context_payload, merge, PUT the full unwrapped object.
+- pipeline_stage and context are DIFFERENT endpoints. To set a stage, PUT /pipeline-stage {"pipeline_stage":"<value>"} — NEVER PUT /context to change a stage. NEVER PUT /context with an empty body or {"context_payload":{}}: that WIPES the ghost's objective/acceptance_criteria/agent_notes. ONLY the plan stage writes /context (via GET-merge-PUT); every other stage treats /context as READ-ONLY.
+- Invoke skills via the Skill tool (confirmed available in this subagent). Pass all inputs as args so nothing blocks on a prompt.`
+
+// ── Resilient structured-agent gate ─────────────────────────────────────
+// Every gate below is a structured agent() call that THROWS on a transient subagent failure
+// (StructuredOutput-not-called "flake", mid-response connection drop, terminal Overloaded) or
+// RETURNS null (user-skip / terminal death). Bare, one flake kills a whole lane that was otherwise
+// succeeding. tryAgent retries the transient cases a few times, fails fast on a FATAL account error
+// (credits/quota/auth — retrying can't help), and on exhaustion returns null so the call site's
+// existing null-handling escalates cleanly instead of the lane crashing on an uncaught throw.
+const FATAL_ERR = /out of (usage )?credits|usage limit|quota|401|403|invalid (x-)?api[- ]?key|authentication/i
+async function tryAgent(prompt, opts, tries = 3) {
+  let last = 'no attempt'
+  for (let attempt = 1; attempt <= tries; attempt++) {
+    try {
+      const r = await agent(prompt, opts)
+      if (r != null) return r
+      last = 'agent() returned null (user-skip or terminal death)'
+    } catch (e) {
+      last = String((e && e.message) || e)
+      if (FATAL_ERR.test(last)) { log(`FATAL ${opts && opts.label}: ${last} — not retrying`); return null }
+    }
+    if (attempt < tries) log(`retry ${opts && opts.label} (${attempt}/${tries - 1}) after: ${last}`)
+  }
+  log(`exhausted ${opts && opts.label} after ${tries} attempts: ${last}`)
+  return null
+}
+
+// ── Schemas ─────────────────────────────────────────────────────────────
+const SETUP = { type:'object', additionalProperties:false, required:['ok','tree_clean','ghost_branch','ghost_title','notes'], properties:{
+  ok:{type:'boolean'}, tree_clean:{type:'boolean'}, ghost_branch:{type:'string'}, ghost_title:{type:'string'}, notes:{type:'string'},
+  pre_ghost_sha:{type:'string',description:'owns-tree only: HEAD before this ghost (the code-review base)'},
+  db_slug:{type:'string',description:'owns-tree only: per-ghost DB slug, e.g. g<short><nonce>'},
+  main_root:{type:'string',description:'owns-tree only: absolute path to the MAIN checkout (guard target)'},
+  main_head_sha:{type:'string',description:'owns-tree only: MAIN HEAD before this ghost (guard baseline)'},
+  main_branch:{type:'string',description:'owns-tree only: MAIN current branch (guard baseline)'} } }
+// owns-tree main-checkout guard verdict
+const GUARD = { type:'object', additionalProperties:false, required:['main_clean','detail'], properties:{
+  main_clean:{type:'boolean'}, detail:{type:'string'} } }
+const PLAN = { type:'object', additionalProperties:false, required:['planned','files','test_plan','summary'], properties:{
+  planned:{type:'boolean'}, files:{type:'array',items:{type:'string'}}, test_plan:{type:'array',items:{type:'string'}}, summary:{type:'string'} } }
+// verdict: PASS (advance) · NEEDS_WORK (loop back & fix) · ESCALATE (fundamentally bad → pull in the human now)
+const REVIEW = { type:'object', additionalProperties:false, required:['verdict','lenses','blockers','escalate_reason','notes'], properties:{
+  verdict:{type:'string',enum:['PASS','NEEDS_WORK','ESCALATE']},
+  lenses:{type:'array',items:{type:'string'},description:'the /panel lenses actually run this cycle'},
+  blockers:{type:'array',items:{type:'string'}},
+  escalate_reason:{type:'string',description:'why a human must decide — non-empty ONLY when verdict=ESCALATE'},
+  notes:{type:'string'},
+  panel_ran:{type:'boolean',description:'code-review only: whether /panel actually ran this cycle (false = skipped because the non-test source diff was unchanged)'},
+  panel_src_id:{type:'string',description:'code-review only: git patch-id of the non-test source diff (the panel-skip fingerprint)'},
+  panel_blockers:{type:'array',items:{type:'string'},description:'code-review only: panel-attributable blockers — fresh this cycle, or carried verbatim when panel_ran=false'} } }
+const IMPL = { type:'object', additionalProperties:false, required:['tests_passed','files_changed','summary'], properties:{
+  tests_passed:{type:'boolean'}, files_changed:{type:'array',items:{type:'string'}}, summary:{type:'string'} } }
+const SHIP = { type:'object', additionalProperties:false, required:['pr_url','pr_number','already_existed'], properties:{
+  pr_url:{type:'string'}, pr_number:{type:'integer'}, already_existed:{type:'boolean'} } }
+const QA = { type:'object', additionalProperties:false, required:['qa_parent_id','auto_passed','human_remaining','already_existed'], properties:{
+  qa_parent_id:{type:'string'}, auto_passed:{type:'integer'}, human_remaining:{type:'array',items:{type:'string'}}, already_existed:{type:'boolean'} } }
+const HANDOFF = { type:'object', additionalProperties:false, required:['handed_off','summary'], properties:{
+  handed_off:{type:'boolean'}, summary:{type:'string'} } }
+// owns-tree only: the no-push commit step's result
+const COMMIT_S = { type:'object', additionalProperties:false, required:['committed','sha','notes'], properties:{
+  committed:{type:'boolean'}, sha:{type:'string'}, notes:{type:'string'} } }
+// owns-tree only: independent test verification (the code-review gate consumes this, not the
+// implementer's self-report)
+const TESTV = { type:'object', additionalProperties:false, required:['tests_passed','detail'], properties:{
+  tests_passed:{type:'boolean'}, detail:{type:'string',description:'MUST quote the verbatim test-runner summary line + the migration gate final line (when configured)'} } }
+
+// ── Shared escalation: pull in the human (3rd path) ─────────────────────
+// Used by BOTH gates for (a) a fundamental ESCALATE verdict and (b) hitting a cycle cap.
+async function escalate(stage, reason) {
+  return await tryAgent(`${CREDS}
+
+ESCALATE (${stage}) — the work is fundamentally blocked and looping will not help. Reason:
+${reason}
+
+Pull in the human Hunter NOW:
+1. Set status to "poltergeist": PUT /api/agent/ghosts/${GHOST_ID}/status {"status":"poltergeist"}.
+2. Set pipeline_stage to "human_review": PUT /api/agent/ghosts/${GHOST_ID}/pipeline-stage {"pipeline_stage":"human_review"}.
+${HUMAN_HUNTER ? `3. Hand off to the human Hunter: POST /api/agent/ghosts/${GHOST_ID}/handoff-hunter {"target_user_id":"${HUMAN_HUNTER}","handoff_notes":"<the reason + that work-in-progress is on branch ${GHOST_BRANCH}>"}.
+4. POST /api/agent/ghosts/${GHOST_ID}/request-approval.` : `3. No human_hunter_id is configured for this repo (.ghost/config.json) — SKIP handoff-hunter (do not invent a user id).
+4. POST /api/agent/ghosts/${GHOST_ID}/request-approval so the ghost surfaces in the approval queue.`}
+5. Post a durable EVP that clearly explains WHY this was escalated (the fundamental problem) and what a human must decide. Note that any work-in-progress is on branch ${GHOST_BRANCH}.
+Do NOT switch git branches — leave the WIP in place for the human. Return handed_off=true with a one-line summary.`,
+    { label:`escalate:${stage}`, phase:stage, schema:HANDOFF, model:'sonnet', effort:'high' })
+}
+
+// ── owns-tree main-checkout guard (in-session safety net) ───────────────
+// A DEDICATED read-only agent (NOT the implement agent self-certifying) asserts MAIN stayed
+// pristine. In-session, a stray edit/relative path could leak to the main checkout; this turns
+// silent corruption into a loud escalation BEFORE we commit/collate.
+async function assertMainUntouched(stage) {
+  return await tryAgent(`${CREDS}
+
+You are the MAIN-CHECKOUT GUARD for ghost ${GHOST_ID} (after ${stage}). The MAIN checkout is at ${MAIN_ROOT}; this ghost's work belongs ONLY in the worktree ${WORKTREE}. Run ONLY read-only checks — touch / reset / clean NOTHING. The DELTA is computed vs the porcelain baseline snapshotted at setup (so pre-existing/external untracked files in main don't false-trip; only NEW dirt from this lane does). Run this ONE command and report its output verbatim:
+\`BL="${MAIN_ROOT}/.claude/state/haunt-cycle/runs/${GHOST_ID}.baseline"; DELTA="$(comm -13 "$BL" <(git -C "${MAIN_ROOT}" status --porcelain | sort) 2>&1)"; H="$(git -C "${MAIN_ROOT}" rev-parse HEAD)"; B="$(git -C "${MAIN_ROOT}" rev-parse --abbrev-ref HEAD)"; printf 'DELTA=[%s]\\nHEAD=%s\\nBRANCH=%s\\n' "$DELTA" "$H" "$B"\`
+Set main_clean=true ONLY if ALL hold: DELTA is empty (no new porcelain lines vs the setup baseline) AND HEAD == ${MAIN_HEAD_SHA} AND BRANCH == ${MAIN_BRANCH}. Otherwise main_clean=false and put DELTA + the changed sha/branch in detail.`,
+    { label:`guard:${stage}`, phase:stage, schema:GUARD, model:'sonnet', effort:'high' })
+}
+
+// Shared guidance for choosing /panel lenses. Route by the panel skill's own Phase-2
+// table — run ONLY the relevant lenses, never all of them — and keep the PER-CYCLE panels
+// LEAN so an unchanged diff isn't re-reviewed by five lenses every loop. The heavy
+// user-persona / product-manager lenses do NOT fire per-cycle in a set run; they run ONCE
+// at the end of the set on the merged collective diff (extermination's UX panel).
+const PLAN_PANEL_ROUTING = `Route /panel by the panel skill's Phase-2 table — run ONLY the relevant lenses, never all of them. For an implementation plan that is staff-engineer + product-manager (technical rigor + scope/value); add senior-ux ONLY if the plan introduces a substantial new UI surface. State which lenses you chose and why.`
+const CODE_PANEL_ROUTING = OWNS_TREE
+  ? `Route /panel by the panel skill's Phase-2 table — run ONLY the relevant lenses, never all of them, and keep this per-cycle panel LEAN: staff-engineer ALWAYS (correctness / security / data-integrity); add senior-ux ONLY when THIS ghost's own diff changes non-trivial UI logic or layout. Do NOT run product-manager or any user-persona lens (this repo's user-* agents in .claude/agents/) per cycle — the extermination set runs ONE end-of-set usability/design panel on the merged collective diff, which is where those lenses belong. State which lenses you chose and why.`
+  : `Route /panel by the panel skill's Phase-2 table — run ONLY the relevant lenses, never all of them: staff-engineer ALWAYS; add senior-ux + the fitting user-persona lens(es) from this repo's .claude/agents/ when the frontend / that surface is touched. State which lenses you chose and why.`
+
+// ── Stage 0: setup ──────────────────────────────────────────────────────
+phase('setup')
+const setupPrompt = OWNS_TREE ? `${CREDS}
+
+You are the SETUP stage of ghost-lane in OWNS-TREE mode for ghost ${GHOST_ID}. An orchestrator already created this git worktree + its branch; do NOT create or switch branches, and a dirty tree is EXPECTED — do NOT abort on it. IMPORTANT: you are running IN-SESSION, so your \$CLAUDE_PROJECT_DIR and CWD point at the MAIN checkout — IGNORE them. The worktree is at the absolute path ${WORKTREE}; use it for every git/file op below.
+1. Assert ${WORKTREE} is a LINKED WORKTREE, not the main checkout: \`[ "$(git -C "${WORKTREE}" rev-parse --git-dir)" != "$(git -C "${WORKTREE}" rev-parse --git-common-dir)" ]\`. If it is NOT a linked worktree, set ok=false and STOP (owns-tree must NEVER run in the main tree).
+2. Record the integration head BEFORE this ghost: \`git -C "${WORKTREE}" rev-parse HEAD\` → return as pre_ghost_sha. Record the current branch: \`git -C "${WORKTREE}" rev-parse --abbrev-ref HEAD\` → return as ghost_branch. Report tree_clean honestly from \`git -C "${WORKTREE}" status --porcelain\` (true if empty) but do NOT abort when dirty.
+3. Derive the MAIN-CHECKOUT GUARD baseline from the worktree (tamper-proof, absolute): \`MAIN_ROOT="$(cd "$(git -C "${WORKTREE}" rev-parse --path-format=absolute --git-common-dir)/.." && pwd)"\` → return as main_root. Then \`git -C "$MAIN_ROOT" rev-parse HEAD\` → main_head_sha and \`git -C "$MAIN_ROOT" rev-parse --abbrev-ref HEAD\` → main_branch. (A later guard asserts MAIN stays at exactly this sha+branch.)
+3b. Write the guard's PORCELAIN BASELINE as ONE command (shell vars do not survive across your separate bash calls — re-derive MR inline). Policy: pre-existing UNTRACKED ("??") entries in main are tolerated (they go in the baseline); any TRACKED modification at baseline is REFUSED (a dirty tracked file would mask lane contamination — the guard compares status lines, not content). Run exactly:
+\`MR="$(cd "$(git -C "${WORKTREE}" rev-parse --path-format=absolute --git-common-dir)/.." && pwd)" && P="$(git -C "$MR" status --porcelain)" && if printf '%s\\n' "$P" | grep -q '^[^?]'; then echo "TRACKED-DIRTY-AT-BASELINE"; else mkdir -p "$MR/.claude/state/haunt-cycle/runs" && printf '%s\\n' "$P" | sort > "$MR/.claude/state/haunt-cycle/runs/${GHOST_ID}.baseline" && echo "BASELINE-OK"; fi\`
+If it prints TRACKED-DIRTY-AT-BASELINE → set ok=false and STOP (notes: main has uncommitted tracked changes; commit or stash them first).
+4. Derive a per-ghost DB slug (>=12 chars, unique to avoid collisions across parallel ghosts): \`SLUG="g${SHORT}$RANDOM"\` → return as db_slug.
+5. Fetch the ghost title: \`curl -s -H "$AUTH" -H "$XGC" "$API/api/agent/ghosts/${GHOST_ID}" | jq -r .title\`.
+6. Set pipeline_stage "planning": PUT .../pipeline-stage {"pipeline_stage":"planning"}.
+7. Post a start EVP: "haunt-cycle (owns-tree, in-session) started on the worktree branch at the recorded base. Entering plan stage."
+8. Write the run artifact to MAIN (NOT the worktree — it must survive worktree reap for resume/audit; gitignored so it won't dirty the guard). Re-derive MR inline (shell vars don't persist across your bash calls): \`MR="$(cd "$(git -C "${WORKTREE}" rev-parse --path-format=absolute --git-common-dir)/.." && pwd)" && mkdir -p "$MR/.claude/state/haunt-cycle/runs" && B=$(git -C "${WORKTREE}" rev-parse --abbrev-ref HEAD) && printf '%s' "{\\"ghost_id\\":\\"${GHOST_ID}\\",\\"branch\\":\\"$B\\",\\"stage\\":\\"setup\\"}" > "$MR/${RUN_ARTIFACT}"\`.
+Return the schema: ok=true, the real tree_clean, ghost_branch, pre_ghost_sha, db_slug, main_root, main_head_sha, main_branch, ghost_title.` : `${CREDS}
+
+You are the SETUP stage of ghost-lane for ghost ${GHOST_ID}.
+FAIL-CLOSED PRECONDITION (do this FIRST, before anything else): assert this is NOT a linked worktree — \`[ "$(git -C "$(git rev-parse --show-toplevel)" rev-parse --git-dir)" = "$(git -C "$(git rev-parse --show-toplevel)" rev-parse --git-common-dir)" ]\` MUST hold (git-dir == git-common-dir → the main checkout). If it is a linked worktree, set ok=false and tree_clean=false and STOP immediately: default mode must NEVER run inside a worktree, because SHIP would push and open a real PR. An orchestrator that owns a worktree must invoke this lane with owns_tree=true instead. (This is the inverse of the owns-tree SETUP's linked-worktree assertion, so the two modes are mutually fail-closed.)
+Do exactly this, in order, all from the main repo at $(git rev-parse --show-toplevel):
+1. Assert the working tree is CLEAN: run \`git -C "$(git rev-parse --show-toplevel)" status --porcelain\`. If it prints ANYTHING, set tree_clean=false, ok=false, STOP. Otherwise tree_clean=true.
+2. \`git -C "$(git rev-parse --show-toplevel)" fetch origin --quiet\`. Create the ghost branch off ${BASE}: \`git -C "$(git rev-parse --show-toplevel)" checkout -B ${BRANCH} origin/${BASE}\` (or local ${BASE} if origin/${BASE} is absent). Idempotent — just check it out if it already exists.
+3. Fetch the ghost title: \`curl -s -H "$AUTH" -H "$XGC" "$API/api/agent/ghosts/${GHOST_ID}" | jq -r .title\`.
+4. Set pipeline_stage "planning": PUT .../pipeline-stage {"pipeline_stage":"planning"}.
+5. Post a start EVP: "haunt-cycle started — branch ${BRANCH} off ${BASE}. Entering plan stage."
+6. Write the run artifact: \`R="$(git rev-parse --show-toplevel)" && mkdir -p "$R/.claude/state/haunt-cycle/runs" && printf '%s' '{"ghost_id":"${GHOST_ID}","branch":"${BRANCH}","stage":"setup"}' > "$R/${RUN_ARTIFACT}"\`.
+Return the schema. If the tree was dirty, ok=false.`
+// Model tiers (user-approved 2026-06-11): inherit ONLY for plan + the review gates;
+// 'opus' for implement; 'sonnet' for mechanical/scripted stages. Saves the bulk of
+// the quota burn without touching review quality.
+const setup = await tryAgent(setupPrompt, { label:'setup', phase:'setup', schema:SETUP, model:'sonnet', effort:'high' })
+
+const setupBad = OWNS_TREE ? (!setup || !setup.ok) : (!setup || !setup.ok || !setup.tree_clean)
+if (setupBad) {
+  log(`ABORT: ${OWNS_TREE ? 'owns-tree setup failed (not a linked worktree?)' : 'working tree not clean or setup failed'} — ${setup ? setup.notes : 'no result'}`)
+  return { aborted:true, reason: OWNS_TREE ? 'owns-tree-setup-failed' : 'dirty-tree-or-setup-failed', setup }
+}
+if (OWNS_TREE) {
+  GHOST_BRANCH  = setup.ghost_branch || BRANCH
+  PRE_GHOST_SHA = setup.pre_ghost_sha || ''
+  DB_SLUG       = setup.db_slug || `g${SHORT}`
+  MAIN_ROOT     = setup.main_root || ''
+  MAIN_HEAD_SHA = setup.main_head_sha || ''
+  MAIN_BRANCH   = setup.main_branch || ''
+  if (!PRE_GHOST_SHA) { log('ABORT: owns-tree setup returned no pre_ghost_sha (cannot scope the review base)'); return { aborted:true, reason:'no-pre-ghost-sha', setup } }
+  if (!MAIN_ROOT || !MAIN_HEAD_SHA) { log('ABORT: owns-tree setup returned no main_root/main_head_sha (cannot guard the main checkout)'); return { aborted:true, reason:'no-main-guard-baseline', setup } }
+}
+log(`setup ok — ${setup.ghost_title} on ${setup.ghost_branch}${OWNS_TREE ? ` (owns-tree; base ${PRE_GHOST_SHA}, db ${DB_SLUG})` : ''}`)
+
+// ── Stage 1+2: plan → plan-review gate loop ─────────────────────────────
+let planReview = null
+for (let cycle = 0; cycle < PLAN_CAP; cycle++) {
+  phase('plan')
+  const isReplan = cycle > 0
+  const planPrompt = OWNS_TREE ? `${CREDS}
+
+You are the PLAN stage of ghost-lane in OWNS-TREE mode (cycle ${cycle}${isReplan ? ' — RE-PLAN addressing the review blockers below' : ''}). You run IN-SESSION: your $CLAUDE_PROJECT_DIR and CWD point at MAIN — IGNORE them. The worktree is ${WORKTREE}; explore and reference ONLY files under ${WORKTREE}. ${FRONTEND_OK ? `This ghost MAY touch the frontend — plan frontend tests (${TEST_FRONTEND || 'the repo frontend suite'}) AND, for any user-visible behavior, plan a headless Playwright e2e spec under frontend/e2e/<feature>/ (tag it @smoke if it is a core flow), modeled on the repo's existing specs under frontend/e2e/. Do NOT run a browser in-lane (dev servers serve MAIN, not this worktree) — the spec is RUN at the set-level integration gate against the MERGED branch, so AUTHOR it here, do not execute it.` : 'This is a BACKEND / non-visual ghost — no Figma, no browser work.'}
+${isReplan ? `The plan-review panel flagged these BLOCKERS — revise the plan in agent_notes to resolve every one:\n${JSON.stringify((planReview && planReview.blockers) || [], null, 2)}\n` : ''}
+1. CLAIM the ghost: \`code=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H "$AUTH" -H "$XGC" "$API/api/agent/ghosts/${GHOST_ID}/claim")\`. 200 or 409 (already ours) → proceed. 400 (bound by unexorcised Spirit Bonds) → STOP: set planned=false, summary="blocked by incomplete Spirit Bonds", write NOTHING to agent_notes. Any other code → planned=false, summary=that error.
+2. Read the ghost context (objective, acceptance_criteria, constraints, files): \`curl -s -H "$AUTH" -H "$XGC" "$API/api/agent/ghosts/${GHOST_ID}/context" | jq '.context_payload'\`.
+3. Explore the WORKTREE codebase to ground the approach — Glob/Grep/Read rooted at ${WORKTREE} (NOT main).
+4. Design the implementation + test plan; write the plan markdown to /tmp/plan_${SHORT}.md.
+5. Persist it to agent_notes. PUT /context REPLACES the entire context_payload — GET, take .context_payload, set .agent_notes, PUT the full UNWRAPPED object (never PUT a bare {"agent_notes":…} or you wipe objective/acceptance_criteria/files the gates need):
+\`\`\`bash
+curl -s "$API/api/agent/ghosts/${GHOST_ID}/context" -H "$AUTH" -H "$XGC" | jq '.context_payload' > /tmp/ctx_${SHORT}.json
+jq --rawfile notes /tmp/plan_${SHORT}.md '.agent_notes = $notes' /tmp/ctx_${SHORT}.json | curl -s -X PUT "$API/api/agent/ghosts/${GHOST_ID}/context" -H "$AUTH" -H "$XGC" -H "Content-Type: application/json" -d @-
+\`\`\`
+6. Post a short Plan EVP: \`POST $API/api/agent/ghosts/${GHOST_ID}/evps {"content":"Plan finalized — <N> files, <M> tests planned. Entering implementation."}\`.
+Return planned=true ONLY if a plan is now in agent_notes, plus the files and test_plan it covers and a one-line summary.${isReplan ? ' On RE-PLAN, GET the existing agent_notes plan and revise it to clear the blockers, then re-PUT via the same recipe.' : ''}` : `${CREDS}
+
+You are the PLAN stage of ghost-lane (cycle ${cycle}${isReplan ? ' — RE-PLAN addressing the review blockers below' : ''}).
+${isReplan ? `The plan-review panel flagged these BLOCKERS — revise the plan in agent_notes to resolve every one:\n${JSON.stringify((planReview && planReview.blockers) || [], null, 2)}\n` : ''}
+Invoke the plugin skill **ghost-hunting-core:commence-haunt** with args: \`${GHOST_ID} --autonomous --stage=plan\` (Skill tool, skill "ghost-hunting-core:commence-haunt"). It claims the ghost (409 = already ours, fine), explores, designs the implementation + test plan, writes the plan to agent_notes, posts a plan EVP, and STOPS without implementing.
+${isReplan ? 'Focus on revising the existing plan to clear the blockers (edit agent_notes directly if cleaner).' : ''}
+Return planned=true if a plan is in agent_notes, plus the files and test_plan it covers.`
+  // deliberate inherit (no model override): design work — plan quality drives everything downstream.
+  await tryAgent(planPrompt, { label:`plan#${cycle}`, phase:'plan', schema:PLAN })
+
+  phase('plan-review')
+  planReview = MECH_ONLY ? { verdict:'PASS', lenses:['(mech-only)'], blockers:[], escalate_reason:'', notes:'mechanism-only smoke: plan-review panel skipped' } : await tryAgent(`${CREDS}
+
+You are the PLAN-REVIEW gate of ghost-lane (cycle ${cycle}, cap ${PLAN_CAP}).
+1. Read the plan from agent_notes: \`curl -s -H "$AUTH" -H "$XGC" "$API/api/agent/ghosts/${GHOST_ID}/context" | jq -r '.context_payload.agent_notes'\`. PRECONDITION: if it is empty / null / whitespace, the PLAN stage produced no plan (claim blocked by Spirit Bonds, or the plan body failed) — do NOT run /panel; return verdict=ESCALATE with escalate_reason="plan stage wrote no plan to agent_notes" and STOP here.
+2. ${PLAN_PANEL_ROUTING}
+   Run /panel (Skill tool, skill "ghost-hunting-core:panel") on the plan with your chosen lenses, passing the plan text + the ghost objective/acceptance_criteria/constraints.
+3. Verdict:
+   - PASS — no blocker.
+   - NEEDS_WORK — blockers a revised plan can fix (loop back to re-plan).
+   - ESCALATE — the work is FUNDAMENTALLY bad: the approach/plan is wrong and re-planning won't fix it, acceptance criteria are contradictory/unachievable/out-of-scope, or there is a security / data-loss concern. Set escalate_reason. Use sparingly — only when a human must decide.
+4. Post an EVP: the verdict, which lenses ran, and cycle ${cycle}/${PLAN_CAP}.
+Return the schema (escalate_reason="" unless ESCALATE; list the lenses you ran).`, { label:`plan-review#${cycle}`, phase:'plan-review', schema:REVIEW, effort:'xhigh' }) // deliberate model inherit: judgment gate
+
+  log(`plan-review cycle ${cycle}: ${planReview ? planReview.verdict : 'null'} (lenses: ${planReview ? (planReview.lenses||[]).join(',') : '?'})`)
+  if (planReview && planReview.verdict === 'PASS') break
+  if (planReview && planReview.verdict === 'ESCALATE') {
+    await escalate('plan-review', planReview.escalate_reason || 'plan-review judged the work fundamentally bad')
+    return { escalated:'plan-review-fundamental', planReview }
+  }
+  if (cycle === PLAN_CAP - 1) {
+    await escalate('plan-review', `Plan-review reached the cycle cap (${PLAN_CAP}) without PASS. Latest blockers: ${JSON.stringify((planReview && planReview.blockers) || [])}`)
+    return { escalated:'plan-review-cap', planReview }
+  }
+}
+
+// ── Stage 3+4: implement → code-review gate loop ────────────────────────
+let codeReview = null
+let impl = null
+let verified = null      // owns-tree: latest independent test verdict (TESTV)
+let verifiedSha = ''     // the GHOST_SHA that verdict covers (skip re-verify on nothing-to-commit re-reviews)
+let lastPanelSrcId = ''  // owns-tree: patch-id of the non-test source diff the last /panel ran on
+let lastPanelBlockers = [] // the panel-attributable blockers from that last panel (carried when the source is unchanged)
+const SAFE_TITLE = String(setup.ghost_title || 'ghost').replace(/[`"$\\]/g, ' ').slice(0, 60)
+for (let cycle = 0; cycle < CODE_CAP; cycle++) {
+  phase('implement')
+  const isFix = cycle > 0
+  const implPrompt = OWNS_TREE ? `${CREDS}
+
+You are the IMPLEMENT stage of ghost-lane in OWNS-TREE mode (cycle ${cycle}${isFix ? ' — FIX the code-review blockers below, change ONLY what is flagged' : ''}). You run IN-SESSION: $CLAUDE_PROJECT_DIR and CWD point at MAIN — IGNORE them.
+EDIT SCOPE (critical): ${WORKTREE} is the ONLY tree you may touch. Every Glob/Grep root, every Read/Edit/Write target, every plan-relative path resolves as an ABSOLUTE path under ${WORKTREE}. NEVER read or edit a file outside ${WORKTREE} — main's copy lives at a DIFFERENT path, and editing it corrupts the main checkout (a guard will catch + escalate it). Changes stay uncommitted until the COMMIT step. ${FRONTEND_OK ? `This ghost MAY touch the frontend (step 3 covers the frontend suite when touched). For any user-visible behavior, WRITE a headless Playwright e2e spec under frontend/e2e/<feature>/ (tag @smoke if a core flow; model it on the repo's existing specs under frontend/e2e/). Do NOT run a browser in-lane (dev servers serve MAIN, not this worktree) — the integration gate runs the spec against the merged branch. No Figma work.` : 'This is a BACKEND / non-visual ghost — no browser/Figma work.'}
+${isFix ? `Code-review flagged:\n${JSON.stringify((codeReview && codeReview.blockers) || [], null, 2)}\n` : ''}
+Set pipeline_stage "implementing": PUT /api/agent/ghosts/${GHOST_ID}/pipeline-stage {"pipeline_stage":"implementing"} (the /pipeline-stage endpoint — NOT /context).
+1. Read the approved plan from agent_notes: \`curl -s -H "$AUTH" -H "$XGC" "$API/api/agent/ghosts/${GHOST_ID}/context" | jq -r '.context_payload.agent_notes'\`.
+2. Implement it per CLAUDE.md (schema/migrations first → domain/business logic → API routes → UI), editing ONLY files under ${WORKTREE}; write tests per the plan.
+${isFix ? 'Make ONLY the fixes the review demanded; do not refactor unrelated code.\n' : ''}${TEST_BACKEND ? `3. PER-GHOST DB ISOLATION + TEST RUN (do NOT write a backend/.env — pass the DB inline so a stray write can't silently land on gitignored config):
+   - Create BOTH isolated DBs: \`"${WORKTREE}/${DB_SCRIPT}" create ${DB_PREFIX}_${DB_SLUG}_test\` AND \`"${WORKTREE}/${DB_SCRIPT}" create ${DB_PREFIX}_${DB_SLUG}\` (the suite schema builds in _test; some repos' integration tests exercise the app engine at the BASE DATABASE_URL and fail with InvalidCatalogNameError if it doesn't exist — creating both is cheap and harmless).
+   - Run backend tests against it as ONE command (the inline env reaches the test runner): \`cd "${WORKTREE}" && DATABASE_URL=$("${WORKTREE}/${DB_SCRIPT}" url ${DB_SLUG}) ${TEST_BACKEND}\`.${TEST_FRONTEND ? ` (Only if the plan touched frontend, also run \`cd "${WORKTREE}" && ${TEST_FRONTEND}\` — no DB needed.)` : ''}` : `3. TEST RUN: no tests.backend command is configured for this repo (.ghost/config.json) — SKIP the suite; run targeted checks on what you changed and say so explicitly in summary.`}
+${MIGRATION_GATE ? `4. MIGRATION GATE (after tests): \`"${WORKTREE}/${MIGRATION_GATE}"\` — HARD: the repo's migrations must fully capture the schema (single head, upgrade clean, no NEW uncommitted drift). If it FAILS/CRASHES the change needs a migration: set tests_passed=false and put the gate output in summary (code-review routes it back).` : `4. MIGRATION GATE: none configured for this repo (isolation.migration_gate is empty) — SKIP this step and note "no migration gate" in summary.`}
+${TEST_BACKEND ? `5. CLEANUP (always, even on failure): \`"${WORKTREE}/${DB_SCRIPT}" drop ${DB_PREFIX}_${DB_SLUG}_test\` and \`"${WORKTREE}/${DB_SCRIPT}" drop ${DB_PREFIX}_${DB_SLUG}\`.` : `5. CLEANUP: nothing to clean (no scratch DBs were created).`}
+6. Post a best-effort execution log (audit, non-fatal if it 4xx's): POST $API/api/agent/ghosts/${GHOST_ID}/log summarizing files changed + the test/migration result.
+Report tests_passed honestly (true ONLY if ${TEST_BACKEND ? 'the suite' : 'your targeted checks'}${MIGRATION_GATE ? ' AND the migration gate' : ''} passed) + files_changed + a one-line summary. Return the schema.` : `${CREDS}
+
+You are the IMPLEMENT stage of ghost-lane (cycle ${cycle}${isFix ? ' — FIX the code-review blockers below, change ONLY what is flagged' : ''}). You are on branch ${BRANCH} in the main tree.
+${isFix ? `Code-review flagged:\n${JSON.stringify((codeReview && codeReview.blockers) || [], null, 2)}\n` : ''}
+Set pipeline_stage "implementing": PUT /api/agent/ghosts/${GHOST_ID}/pipeline-stage {"pipeline_stage":"implementing"} (the /pipeline-stage endpoint — NOT /context).
+Invoke the plugin skill **ghost-hunting-core:commence-haunt** with args: \`${GHOST_ID} --autonomous --stage=implement --no-exorcise\` (Skill tool, skill "ghost-hunting-core:commence-haunt"). It reads the approved plan from agent_notes, implements it per CLAUDE.md, writes + runs tests (${TEST_ALL || TEST_BACKEND || 'the repo test suite'})${HAS_BROWSER ? `, does a browser check (via ${BROWSER_TOOL})` : ', SKIPS browser verification (no browser tool configured for this repo)'}, and STOPS without committing or exorcising. Leave changes uncommitted (the ship stage commits).
+${isFix ? 'Make ONLY the fixes the review demanded; do not refactor unrelated code.' : ''}
+Run the full suite and report tests_passed honestly. Return the schema.`
+  // deliberate opus override (user-approved 2026-06-11): the core implementation work.
+  impl = await tryAgent(implPrompt, { label:`implement#${cycle}`, phase:'implement', schema:IMPL, model:'opus' })
+
+  if (!impl || !impl.tests_passed) log(`implement cycle ${cycle}: tests/migration-gate not green — code-review will route it`)
+
+  // ── OWNS-TREE: guard that the in-session IMPLEMENT did not leak into MAIN, BEFORE committing. ──
+  if (OWNS_TREE) {
+    const g = await assertMainUntouched('implement')
+    if (!g || !g.main_clean) {
+      await escalate('implement', `In-session IMPLEMENT contaminated the MAIN checkout at ${MAIN_ROOT}: ${g ? g.detail : 'guard agent failed'}. Refusing to commit/collate — a human must inspect and clean main.`)
+      return { escalated:'main-contaminated', guard:g }
+    }
+  }
+
+  // ── OWNS-TREE: commit the ghost's work (no push) BEFORE review, so the review base
+  //    diff (${PRE_GHOST_SHA}...HEAD) is EXACTLY this ghost's commit(s). ──
+  if (OWNS_TREE) {
+    phase('commit')
+    const committed = await tryAgent(`${CREDS}
+
+You are the COMMIT step of ghost-lane (owns-tree, cycle ${cycle}). The implementation for ghost ${GHOST_ID} is uncommitted in the worktree on branch ${GHOST_BRANCH}.
+Run the deterministic no-push commit primitive as ONE command — the \`cd\` MUST be in the same invocation as the script, because the commit script uses CWD-relative git and your CWD is otherwise MAIN:
+\`cd "${WORKTREE}" && (source backend/venv/bin/activate 2>/dev/null; fl="$(git diff --name-only -- '*.py'; git ls-files -o --exclude-standard -- '*.py')"; [ -n "$fl" ] && ruff format $fl >/dev/null 2>&1 || true); "${WORKTREE}/${COMMIT_SCRIPT}" --ghost ${GHOST_ID} --message "${SAFE_TITLE} (${SHORT})"\`
+(The \`ruff format\` writes ONLY the ghost's changed/new .py files — formatting the WHOLE backend tree swept ~100 unrelated files (models, repos, migrations) into the commit and failed code-review as contamination. Best-effort and non-fatal — a silent no-op in repos without a Python backend; runs in a subshell so the outer CWD stays at ${WORKTREE} for the commit script's CWD-relative git.)
+It secret-scans BEFORE staging, stages with an explicit pathspec, commits with the Co-Authored-By trailer, prints the new SHA, and does NOT push.
+- Prints a SHA → return committed=true and that sha.
+- HARD FAILs on a secret (exit 3) → return committed=false, reason in notes.
+- "nothing to commit" (idempotent no-op, exit 0, no SHA) → return committed=false, notes="nothing to commit".
+Return the schema.`, { label:`commit#${cycle}`, phase:'commit', schema:COMMIT_S, model:'sonnet', effort:'high' })
+    if (committed && committed.committed && committed.sha) {
+      GHOST_SHA = committed.sha
+      log(`commit cycle ${cycle}: ${GHOST_SHA}`)
+    } else if (cycle > 0 && GHOST_SHA && committed && /nothing to commit/i.test(committed.notes || '')) {
+      log(`commit cycle ${cycle}: nothing new to commit; re-reviewing existing ${GHOST_SHA}`)
+    } else {
+      await escalate('commit', `The commit primitive produced no commit (cycle ${cycle}): ${committed ? committed.notes : 'no result'}. A secret-scan HARD FAIL or empty initial tree blocks collation.`)
+      return { escalated:'commit-blocked', committed }
+    }
+  }
+
+  // ── OWNS-TREE: INDEPENDENT TEST VERIFY — re-run the isolated-DB suite + migration gate so the
+  //    code-review gate consumes an independent signal instead of the implementer's self-report.
+  //    Skipped when: MECH_ONLY (like the panels), no tests.backend configured (guarded above), the
+  //    implementer already reported red (code-review routes that back regardless), or no new commit
+  //    landed (the prior verdict covers GHOST_SHA). ──
+  if (OWNS_TREE && !MECH_ONLY && TEST_BACKEND && impl && impl.tests_passed && GHOST_SHA && GHOST_SHA !== verifiedSha) {
+    const v = await tryAgent(`${CREDS}
+
+You are the INDEPENDENT TEST VERIFIER of ghost-lane (owns-tree, cycle ${cycle}) for ghost ${GHOST_ID}. The IMPLEMENT stage self-reported a green suite; your job is to independently confirm it on the COMMITTED state at ${GHOST_SHA}. You change NOTHING except a scratch DB. You run IN-SESSION: $CLAUDE_PROJECT_DIR and CWD point at MAIN — IGNORE them; every command targets ${WORKTREE}.
+1. VERIFIED STATE == COMMITTED STATE: run \`git -C "${WORKTREE}" status --porcelain\`. The commit primitive stages by explicit pathspec, so leftovers are possible. If it lists ANY modified/untracked source, test, config, migration, or dependency file (anything that could affect the suite — scratch artifacts like /tmp paths or .claude/state are ignorable), then the tree you'd test differs from the commit that gets collated: set tests_passed=false, put the porcelain output in detail, and STOP (skip steps 2-4).
+2. Create BOTH isolated scratch DBs (distinct slug — cannot collide with the implement stage's): \`"${WORKTREE}/${DB_SCRIPT}" create ${DB_PREFIX}_${DB_SLUG}v_test\` AND \`"${WORKTREE}/${DB_SCRIPT}" create ${DB_PREFIX}_${DB_SLUG}v\` (some integration tests exercise the app engine at the BASE DATABASE_URL — it must exist). Run the backend suite against it as ONE command: \`cd "${WORKTREE}" && DATABASE_URL=$("${WORKTREE}/${DB_SCRIPT}" url ${DB_SLUG}v) ${TEST_BACKEND}\`.
+${MIGRATION_GATE ? `3. Run the migration gate: \`"${WORKTREE}/${MIGRATION_GATE}"\`.` : `3. Migration gate: none configured for this repo — SKIP.`}
+${FRONTEND_OK && TEST_FRONTEND ? `3b. FRONTEND SUITE (only if the committed diff touches frontend/ — check \`git -C "${WORKTREE}" diff --name-only ${PRE_GHOST_SHA}...HEAD\`): run \`cd "${WORKTREE}" && ${TEST_FRONTEND}\` (no DB needed) and include the verbatim frontend-suite summary line in detail alongside the backend one. A frontend failure means tests_passed=false.
+` : ''}4. CLEANUP (always, even on failure): \`"${WORKTREE}/${DB_SCRIPT}" drop ${DB_PREFIX}_${DB_SLUG}v_test\` and \`"${WORKTREE}/${DB_SCRIPT}" drop ${DB_PREFIX}_${DB_SLUG}v\`.
+5. EVIDENCE (required): detail MUST quote the verbatim test-runner summary line (e.g. pytest's "N passed … in Xs")${MIGRATION_GATE ? " AND the migration gate's final pass/fail line" : ''}${FRONTEND_OK && TEST_FRONTEND ? ' AND, when the diff touched frontend/, the verbatim frontend-suite summary line' : ''}. A bare boolean without the quoted line(s) is not acceptable.
+BASELINE-RED (pre-existing failures on the untouched base, from the set's baseline stage): ${JSON.stringify(BASELINE_RED)} — a test in this list that fails is NOT your regression; ignore it and name any you ignored in detail. Report tests_passed=true ONLY if EVERY failing test is in the BASELINE-RED list (no NEW failure this ghost caused)${MIGRATION_GATE ? ' AND the migration gate passed' : ''}. Report honestly — a real (non-baseline) failure here routes back to the implementer, not to you.`, { label:`verify#${cycle}`, phase:'code-review', schema:TESTV, model:'sonnet', effort:'high' })
+    verified = v || { tests_passed:false, detail:'verifier agent returned no result — fail closed' }
+    verifiedSha = GHOST_SHA
+    if (!verified.tests_passed) log(`verify#${cycle}: DISCREPANCY — implement self-reported green, independent verifier reports RED: ${verified.detail}`)
+    else log(`verify#${cycle}: independently confirmed green at ${GHOST_SHA.slice(0,8)}`)
+  }
+
+  phase('code-review')
+  // Only present the verifier verdict if it covers the CURRENT commit — a red implement cycle
+  // commits new work but skips verify, and a stale green verdict must not masquerade as current.
+  const vNow = (verified && verifiedSha === GHOST_SHA) ? verified : null
+  const TEST_SIGNALS = TEST_BACKEND
+    ? `TEST SIGNALS (do NOT re-run tests yourself): the IMPLEMENT stage self-reported tests_passed=${impl && impl.tests_passed ? 'true' : 'false'}; ${vNow ? `an INDEPENDENT verifier re-ran the isolated-DB suite${MIGRATION_GATE ? ' + migration gate' : ''} on the committed state and reported tests_passed=${vNow.tests_passed ? 'true' : 'false'} — its evidence: ${vNow.detail}` : 'the independent verifier did NOT run for this commit (the implementer reported red) — treat the test dimension as FAILING'}. The test dimension counts as green ONLY if BOTH signals are true; a verifier-red or any disagreement is a blocker → NEEDS_WORK, and you MUST copy the verifier's detail verbatim into blockers so the next implement fix cycle sees exactly what failed. With the test dimension settled by those signals, focus on the criteria matrix + panel.`
+    : `TEST SIGNALS: no tests.backend command is configured for this repo, so there is NO suite run and NO independent verifier — the implementer self-reported ${impl && impl.tests_passed ? 'green targeted checks' : 'FAILING checks'}. Weigh the diff yourself accordingly and note the missing test config in notes.`
+  const crPrompt = OWNS_TREE ? `${CREDS}
+
+You are the CODE-REVIEW gate of ghost-lane in OWNS-TREE mode (cycle ${cycle}, cap ${CODE_CAP}). You run IN-SESSION: $CLAUDE_PROJECT_DIR points at MAIN — IGNORE it. This ghost's work is COMMITTED in the worktree ${WORKTREE} on branch ${GHOST_BRANCH}; the integration head before this ghost is ${PRE_GHOST_SHA}, the latest ghost commit is ${GHOST_SHA}.
+${TEST_SIGNALS}
+Set pipeline_stage "code_review": PUT /api/agent/ghosts/${GHOST_ID}/pipeline-stage {"pipeline_stage":"code_review"} (the /pipeline-stage endpoint — NOT /context).
+1. ASSERT LINEARITY FIRST: \`[ "$(git -C "${WORKTREE}" rev-list --count --merges ${PRE_GHOST_SHA}..HEAD)" = "0" ]\`. Only then does ${PRE_GHOST_SHA}...HEAD equal exactly THIS ghost's commit(s). If a merge intervened, review just \`git -C "${WORKTREE}" show ${GHOST_SHA}\` instead and say so in notes.
+2. Gather the delta: \`git -C "${WORKTREE}" diff ${PRE_GHOST_SHA}...HEAD --name-only\`, then read the changed files (absolute paths under ${WORKTREE}). CAP at 30 files — if more, sort by \`git -C "${WORKTREE}" diff ${PRE_GHOST_SHA}...HEAD --stat\`, read the top 30, summarize the rest by name.
+3. ACCEPTANCE-CRITERIA MATRIX (REQUIRED — /panel does NOT do this): read the ghost's criteria \`curl -s -H "$AUTH" -H "$XGC" "$API/api/agent/ghosts/${GHOST_ID}/context" | jq -r '.context_payload.acceptance_criteria'\`; for EACH criterion emit Met / Partial / Not-Met with file:line evidence from the diff. Any Not-Met / Partial the diff was meant to satisfy → a blocker.
+4. PANEL — skip if the source is unchanged since the last panel (a test-only fix, e.g. quieting a flaky test, must NOT force a panel re-run). First fingerprint this ghost's NON-TEST source diff:
+   \`FID=$(git -C "${WORKTREE}" diff ${PRE_GHOST_SHA}...HEAD -- . ':(exclude,glob)**/test_*.py' ':(exclude,glob)**/*_test.py' ':(exclude,glob)**/*.test.ts' ':(exclude,glob)**/*.test.tsx' ':(exclude,glob)**/*.spec.ts' ':(exclude,glob)frontend/e2e/**' | git patch-id --stable | awk '{print $1}')\`
+   The prior cycle ran /panel on fingerprint "${lastPanelSrcId || '(none yet)'}" and it produced these panel blockers: ${JSON.stringify(lastPanelBlockers)}.
+   - If a prior fingerprint exists (not "(none yet)") AND FID is non-empty AND FID equals it: the reviewed source is byte-identical since the last panel, so its result cannot change — do NOT re-run /panel. Set panel_ran=false and panel_blockers = the prior panel blockers above, VERBATIM.
+   - Otherwise: ${CODE_PANEL_ROUTING} Run /panel (Skill tool, skill "ghost-hunting-core:panel") on the diff with your chosen lenses; set panel_ran=true and panel_blockers = its blocker-tagged findings ([] if none).
+   Always return panel_src_id=FID. A NON-EMPTY panel_blockers (fresh or carried) counts as a blocker → NEEDS_WORK.
+5. Post an EVP: the per-criterion matrix + the panel verdict + which lenses ran + cycle ${cycle}/${CODE_CAP}.
+Map the verdict: PASS (every acceptance criterion Met + panel_blockers empty + the test dimension green per the TEST SIGNALS above) → PASS; fixable blockers (a Not-Met/Partial criterion, a non-empty panel_blockers, a verifier-red/disagreement, or a missing migration the gate flagged) → NEEDS_WORK; fundamentally broken (plan wrong, criteria unachievable, security/data-loss) → ESCALATE (set escalate_reason).
+Return the schema (list the lenses that ran; set panel_ran, panel_src_id, and panel_blockers per step 4; fold panel_blockers into the overall blockers array; put the criteria matrix summary in notes).` : `${CREDS}
+
+You are the CODE-REVIEW gate of ghost-lane (cycle ${cycle}, cap ${CODE_CAP}). You are on branch ${BRANCH}; the implementation is in the working tree (uncommitted).
+Set pipeline_stage "code_review": PUT /api/agent/ghosts/${GHOST_ID}/pipeline-stage {"pipeline_stage":"code_review"} (the /pipeline-stage endpoint — NOT /context).
+Invoke the plugin skill **ghost-hunting-core:review-haunt** with args: \`${GHOST_ID} --base=${BASE} --force-panel\` (Skill tool, skill "ghost-hunting-core:review-haunt"). \`--force-panel\` makes it run /panel on the diff EVERY cycle (never skipped). ${CODE_PANEL_ROUTING}
+Map the verdict: PASS (tests green + criteria met) → PASS; "NEEDS WORK"/"FAIL" with fixable issues → NEEDS_WORK; fundamentally broken (the plan was wrong, criteria unachievable, security/data-loss) → ESCALATE (set escalate_reason).
+Return the schema (list the lenses that ran).`
+  codeReview = MECH_ONLY ? { verdict:'PASS', lenses:['(mech-only)'], blockers:[], escalate_reason:'', notes:'mechanism-only smoke: code-review panel skipped' } : await tryAgent(crPrompt, { label:`code-review#${cycle}`, phase:'code-review', schema:REVIEW, effort:'xhigh' }) // deliberate model inherit: judgment gate
+
+  // A2: remember the fingerprint + panel blockers this cycle's /panel ran on, so a later
+  // cycle that only touched tests (unchanged source) can skip re-running the panel.
+  if (codeReview && codeReview.panel_src_id !== undefined) {
+    lastPanelSrcId = codeReview.panel_src_id || lastPanelSrcId
+    lastPanelBlockers = Array.isArray(codeReview.panel_blockers) ? codeReview.panel_blockers : lastPanelBlockers
+  }
+
+  log(`code-review cycle ${cycle}: ${codeReview ? codeReview.verdict : 'null'} (lenses: ${codeReview ? (codeReview.lenses||[]).join(',') : '?'})${codeReview && codeReview.panel_ran === false ? ' [panel skipped: source unchanged]' : ''}`)
+  if (codeReview && codeReview.verdict === 'PASS') break
+  if (codeReview && codeReview.verdict === 'ESCALATE') {
+    await escalate('code-review', codeReview.escalate_reason || 'code-review judged the work fundamentally bad')
+    return { escalated:'code-review-fundamental', codeReview }
+  }
+  if (cycle === CODE_CAP - 1) {
+    await escalate('code-review', `Code-review reached the cycle cap (${CODE_CAP}) without PASS. Latest blockers: ${JSON.stringify((codeReview && codeReview.blockers) || [])}`)
+    return { escalated:'code-review-cap', codeReview }
+  }
+}
+
+// ── OWNS-TREE + NO_SHIP: stop after code-review PASS; the orchestrator collates + ships. ──
+if (NO_SHIP) {
+  // Final MAIN guard before declaring integration-ready — code-review could also have leaked.
+  if (OWNS_TREE) {
+    const gs = await assertMainUntouched('stop')
+    if (!gs || !gs.main_clean) {
+      await escalate('code-review', `MAIN checkout was modified during the owns-tree lane (caught at STOP) at ${MAIN_ROOT}: ${gs ? gs.detail : 'guard agent failed'}. Not declaring integration-ready.`)
+      return { escalated:'main-contaminated-at-stop', guard:gs }
+    }
+  }
+  await tryAgent(`${CREDS}
+
+You are the STOP step of ghost-lane (no-ship) for ghost ${GHOST_ID}. Code-review PASSED; the work is committed at ${GHOST_SHA || '(see worktree)'} on branch ${GHOST_BRANCH} (base ${PRE_GHOST_SHA}); nothing is pushed.
+1. Update the run artifact stage to "committed" (it lives in MAIN, not the worktree — survives reap): \`mkdir -p "${MAIN_ROOT}/.claude/state/haunt-cycle/runs" && printf '%s' '{"ghost_id":"${GHOST_ID}","branch":"${GHOST_BRANCH}","stage":"committed","ghost_commit_sha":"${GHOST_SHA}","base_sha":"${PRE_GHOST_SHA}"}' > "${MAIN_ROOT}/${RUN_ARTIFACT}"\`.
+2. Leave pipeline_stage as-is (it is "code_review"; the API enum has NO "integration" value — valid stages are planning/plan_review/implementing/code_review/human_review — and the orchestrator tracks collation via the run artifact above, not pipeline_stage). Do NOT attempt a pipeline_stage PUT here.
+3. Post an EVP: "owns-tree lane done — committed ${GHOST_SHA} on ${GHOST_BRANCH} (base ${PRE_GHOST_SHA}). Awaiting integration/collation by the orchestrator; not pushed."
+Return handed_off=true with a one-line summary.`, { label:'stop', phase:'handoff', schema:HANDOFF, model:'sonnet', effort:'high' })
+  log(`STOP (no-ship): ${GHOST_SHA} on ${GHOST_BRANCH}, base ${PRE_GHOST_SHA}`)
+  return {
+    ghost_id: GHOST_ID,
+    ghost_title: setup.ghost_title,
+    branch: GHOST_BRANCH,
+    ghost_commit_sha: GHOST_SHA,
+    base_sha: PRE_GHOST_SHA,
+    verdict: 'committed-no-ship',
+  }
+}
+
+// ── Stage 5: ship (commit + push + open PR) — idempotent ────────────────
+phase('ship')
+const ship = await tryAgent(`${CREDS}
+
+You are the SHIP stage of ghost-lane. You are on branch ${BRANCH} with passing, code-reviewed changes uncommitted in the tree.
+IDEMPOTENCY: first check \`gh pr list --head ${BRANCH} --json number,url --jq '.[0]'\`. If a PR already exists for ${BRANCH}, return it with already_existed=true and do nothing else.
+FIRST best-effort format the backend tree so the committed diff is formatted: \`(cd "$(git rev-parse --show-toplevel)/backend" && source venv/bin/activate 2>/dev/null && ruff format . >/dev/null 2>&1 || true)\` (best-effort — a silent no-op in repos without a Python backend; unformatted lane output has shipped red builds — user-approved 2026-06-11).
+Then invoke the global skill **wrap-up** with args \`--yes\` (Skill tool): secret-scan, commit with an explicit pathspec, push ${BRANCH}, open a PR against ${BASE}. If wrap-up aborts on an unexcludable secret, do NOT force — set status poltergeist, post an EVP, return pr_url="" pr_number=0.
+After the PR opens, post an EVP with the PR url and append it to the ghost's agent_notes (GET/merge/PUT the full context_payload). Return the schema.`, { label:'ship', phase:'ship', schema:SHIP, model:'sonnet', effort:'high' })
+
+if (!ship || !ship.pr_url) {
+  log('ship failed (no PR) — stopping')
+  return { setup, planReview, impl, codeReview, ship, stopped:'ship-failed' }
+}
+log(`ship: PR ${ship.pr_url}${ship.already_existed ? ' (existed)' : ''}`)
+
+// ── Stage 6: QA tree (in-cycle, before merge gate) — idempotent ─────────
+phase('qa')
+let qa = null
+if (!QA_SEANCE) {
+  log('qa: SKIPPED — no qa_seance_id configured (.ghost/config.json seance.qa_seance_id is empty); the handoff EVP will note that QA must be run manually')
+} else {
+  qa = await tryAgent(`${CREDS}
+
+You are the QA stage of ghost-lane. PR ${ship.pr_url} (#${ship.pr_number}) is open for branch ${BRANCH}; you are on that branch.
+IDEMPOTENCY: search for an existing QA parent for this PR: \`curl -s -H "$AUTH" -H "$XGC" "$API/api/agent/search?q=PR+%23${ship.pr_number}" | jq '.tasks[]? | select(.title|startswith("[QA] PR"))'\`. If one exists, reuse its id (already_existed=true) and skip to verify.
+1. Build the tree: invoke global skill **qa-pr** with args \`--yes --seance=${QA_SEANCE}\` (Skill tool).
+2. Run checks: invoke global skill **verify-qa-ghost** with args \`<PARENT_ID> --yes\` (Skill tool) — auto-runs shell/http/browser/code_inspection methods, auto-exorcises passing subtasks; never exorcises the parent or requests approval.
+Return the parent id, count of auto-passed subtasks, and the human-only remainder.`, { label:'qa', phase:'qa', schema:QA, model:'sonnet', effort:'high' })
+
+  log(`qa: parent ${qa ? qa.qa_parent_id : '?'} — ${qa ? qa.auto_passed : 0} auto-passed, ${qa ? (qa.human_remaining||[]).length : '?'} for human`)
+}
+
+// ── Stage 7: human merge gate ───────────────────────────────────────────
+phase('handoff')
+const handoff = await tryAgent(`${CREDS}
+
+You are the HANDOFF stage of ghost-lane — the human merge gate. Everything passed; PR ${ship.pr_url} is open${qa ? ` with a QA tree (parent ${qa.qa_parent_id})` : ' (QA tree skipped — no QA séance configured; note this so a human runs QA manually)'}.
+1. Set pipeline_stage "human_review" and status "purgatory".
+2. ${HUMAN_HUNTER ? `Hand off to the human Hunter: POST /api/agent/ghosts/${GHOST_ID}/handoff-hunter {"target_user_id":"${HUMAN_HUNTER}","handoff_notes":"Ready to merge — PR ${ship.pr_url}; QA parent ${qa ? qa.qa_parent_id : 'n/a (skipped)'}"}.` : `No human_hunter_id is configured for this repo (.ghost/config.json) — SKIP handoff-hunter (do not invent a user id); the EVP below is the human surface.`}${NO_BINDING_CIRCLE ? ` Do NOT request approval (unattended mode — the orchestrator exorcises on merge).` : ` Then POST /api/agent/ghosts/${GHOST_ID}/request-approval.`}
+3. Post a durable EVP: "Ready for human review + merge. PR: ${ship.pr_url}. QA: ${qa ? `${qa.auto_passed} auto-passed, ${(qa.human_remaining||[]).length} human items` : 'skipped (no QA séance configured) — run /qa-pr manually'}. Merge the PR to complete; exorcise on merge."
+4. Restore the main tree: \`git -C "$(git rev-parse --show-toplevel)" checkout ${BASE}\` (the ${BRANCH} branch + PR persist on the remote).
+5. Update the run artifact stage to "handoff".
+Return handed_off=true and a one-line summary.`, { label:'handoff', phase:'handoff', schema:HANDOFF, model:'sonnet', effort:'high' })
+
+return {
+  ghost_id: GHOST_ID,
+  ghost_title: setup.ghost_title,
+  branch: BRANCH,
+  pr_url: ship.pr_url,
+  pr_number: ship.pr_number,
+  qa_parent_id: qa ? qa.qa_parent_id : null,
+  qa_auto_passed: qa ? qa.auto_passed : 0,
+  qa_human_remaining: qa ? qa.human_remaining : [],
+  verdict: 'handed-to-human',
+  handed_off: handoff ? handoff.handed_off : false,
+}

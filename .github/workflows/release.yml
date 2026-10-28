@@ -1,0 +1,35 @@
+# Lives in the public ghost-kit mirror (published from the ghosthunting monorepo's
+# plugins/ghost-hunting-core/mirror/). The publisher pushes a vX.Y.Z tag with a deploy key; this
+# turns that tag into a GitHub Release with install.sh attached, so
+#   https://github.com/jweilbach/ghost-kit/releases/latest/download/install.sh
+# always serves the installer from a tagged release.
+name: Release
+
+on:
+  push:
+    tags: ['v*.*.*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: The tag must match plugin.json
+        run: |
+          V=$(jq -r .version plugins/ghost-hunting-core/.claude-plugin/plugin.json)
+          [ "v$V" = "$GITHUB_REF_NAME" ] || { echo "::error::tag $GITHUB_REF_NAME does not match plugin.json v$V"; exit 1; }
+      - name: Create the release with install.sh attached
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" install.sh --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" install.sh \
+              --title "ghost-kit $GITHUB_REF_NAME" --latest \
+              --notes "Install or update: \`curl -fsSL https://github.com/jweilbach/ghost-kit/releases/latest/download/install.sh | bash\`, then type /ghost-onboard in Claude Code."
+          fi

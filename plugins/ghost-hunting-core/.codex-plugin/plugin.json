@@ -1,0 +1,19 @@
+{
+  "name": "ghost-hunting-core",
+  "version": "1.10.0",
+  "description": "Shared Ghost Hunting skills and native Codex workflow execution",
+  "author": {
+    "name": "Justin Weilbach",
+    "email": "justinweilbach@gmail.com"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Ghost Hunting Core",
+    "shortDescription": "Use Ghost Hunting Core in Codex.",
+    "longDescription": "Use the same canonical Ghost Hunting lifecycle and repo workflows from Claude Code and Codex CLI.",
+    "developerName": "Justin Weilbach",
+    "category": "Productivity",
+    "capabilities": [],
+    "defaultPrompt": "Help me use Ghost Hunting Core."
+  }
+}

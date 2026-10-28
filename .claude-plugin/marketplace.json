@@ -1,0 +1,11 @@
+{
+  "name": "ghost-kit",
+  "owner": { "name": "Justin Weilbach", "email": "justinweilbach@gmail.com" },
+  "plugins": [
+    {
+      "name": "ghost-hunting-core",
+      "source": "./plugins/ghost-hunting-core",
+      "description": "Ghost Hunting lifecycle skills (haunt, commence-haunt, review-haunt, ...) + workflow vendoring via /ghost-sync"
+    }
+  ]
+}

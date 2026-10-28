@@ -1,0 +1,9 @@
+{
+  "name": "ghost-hunting-core",
+  "version": "1.10.0",
+  "description": "Ghost Hunting lifecycle skills + workflow vendoring. Version must equal EXPECTED_PLUGIN_VERSION in backend/app/core/client_contract.py (CI-enforced).",
+  "author": {
+    "name": "Justin Weilbach",
+    "email": "justinweilbach@gmail.com"
+  }
+}

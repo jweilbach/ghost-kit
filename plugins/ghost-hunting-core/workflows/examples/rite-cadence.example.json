@@ -1,0 +1,161 @@
+{
+  "_about": "Worked example of a rite-cadence wave plan (the artifact the human-validated planning conversation OUTPUTS). Modeled on a real run (an overworld-game rite, wave 3: warp/world-map ∥ residences) — the file lists, prompts, and gate commands are that repo's, kept as an illustration of the required specificity; replace them with YOUR rite's content. The runnable `waves` array below is a frontend wave; `_backend_wave_example` shows the NEW backend/migration capability as a reference snippet (add such waves to `waves`, backend-before-frontend, only when your repo configures the isolation scripts). Replace every __PLACEHOLDER__ token with real values, then pass the object as args to the `rite-cadence` workflow. `rite-cadence({ waves, worktree_path, branch, dry_run:true })` first to validate.",
+  "_rules": [
+    "Replace __WORKTREE_PATH__ (absolute path to the ext/* worktree, e.g. <repo>/.haunt-wt/<rite-slug>), __RITE_ID__, and every __GHOST_ID_*__ (Ghost Hunting UUIDs) before running.",
+    "implementers[].files MUST be pairwise DISJOINT within a wave (that's what makes the shared worktree safe). A file two ghosts both need must be OWNED by exactly ONE implementer — route the other ghost's need through a prop/callback, or sequence them into separate waves.",
+    "Backend work rides waves flagged backend:true — they get a runner-owned scratch Postgres ({{db_url}} injected into gate_cmds; required there, rejected elsewhere), the engine-appended migration-gate (+ pg-smoke when the repo sets .isolation.pg_smoke) gates, and a HARD ownership check (realized files ⊆ declared). Backend waves sort BEFORE frontend waves. They require the repo to configure isolation.db_script + isolation.migration_gate (+ db_prefix); validatePlan refuses a backend wave otherwise.",
+    "A migration-producing wave is flagged migration:true and has EXACTLY ONE implementer. NEVER declare paths under a migrations versions/ directory (e.g. backend/migrations/versions/ or backend/alembic/versions/) — revision numbers depend on the live head; the runner detects the generated file at runtime, commits it under the primary ghost, and (when isolation.db_migrate is set) proves reversibility (downgrade to the pre-wave head → upgrade → drift gate) post-commit.",
+    "gate_cmds run from the worktree root and are repo-specific (use your repo's test commands from .ghost/config.json — .tests.frontend / .tests.backend). Frontend waves: frontend/byte-gate only. Backend waves: DATABASE_URL={{db_url}} TIMEOUT_SECS=1500 <tests.backend> (the pytest suite is often hermetic sqlite — the scratch DB is for migrate/seed/pg-smoke) plus targeted ruff.",
+    "primary_ghost_id must be one of the wave's ghost ids; harden/reconcile sweep, runtime-detected migration, and harden-fix commits are attributed to it.",
+    "stop_before / resume_from name a wave; use them for approval gates (e.g. stop_before a J1 wave). Resume payloads carry baseline_red — pass it back via args.baseline_red to skip re-deriving the baseline."
+  ],
+  "_backend_wave_example": {
+    "name": "creature-substrate",
+    "migration": true,
+    "primary_ghost_id": "__GHOST_ID_SUBSTRATE__",
+    "ghosts": [
+      {
+        "id": "__GHOST_ID_SUBSTRATE__",
+        "title": "Creature substrate: seed migration + species registry",
+        "files": [
+          "backend/app/services/graph_seed.py",
+          "backend/app/services/field_schema.py",
+          "backend/app/services/creature_registry.py",
+          "backend/tests/test_field_schema.py"
+        ],
+        "commit_message": "Creature substrate: seed migration + species registry + resolver",
+        "commit_body": "Ghost: __GHOST_ID_SUBSTRATE__"
+      }
+    ],
+    "implementers": [
+      {
+        "label": "substrate",
+        "files": [
+          "backend/app/services/graph_seed.py",
+          "backend/app/services/field_schema.py",
+          "backend/app/services/creature_registry.py",
+          "backend/tests/test_field_schema.py"
+        ],
+        "prompt": "…full task spec. Note: the seed migration file is NOT in this list — the runner appends live-head-numbering instructions and detects/commits the generated file itself."
+      }
+    ],
+    "gate_cmds": [
+      "bash -o pipefail -c 'cd <WT> && DATABASE_URL={{db_url}} TIMEOUT_SECS=1500 ./scripts/test.sh backend 2>&1 | tail -8'",
+      "(cd <WT>/backend && venv/bin/python -m ruff check app/services/graph_seed.py app/services/field_schema.py app/services/creature_registry.py)"
+    ]
+  },
+  "worktree_path": "__WORKTREE_PATH__",
+  "branch": "ext/owv2",
+  "contract_path": "manifests/overworld-v2-city-character.md",
+  "rite_id": "__RITE_ID__",
+  "stop_before": "",
+  "resume_from": "",
+  "dry_run": false,
+  "waves": [
+    {
+      "name": "wave-3-warp-residences",
+      "primary_ghost_id": "__GHOST_ID_WARP__",
+      "_comment": "generateDialogue.js is genuinely shared (D's road-sign edits + I's house dispatch); it is OWNED here by the I implementer, and the D prompt is told not to touch it — exactly how the real session resolved it (committed under I).",
+      "ghosts": [
+        {
+          "id": "__GHOST_ID_WARP__",
+          "title": "V2-D warp + world map",
+          "files": [
+            "frontend/src/game/bridge.js",
+            "frontend/src/game/scenes/WorldScene.js",
+            "frontend/src/game/ui/DialogueBox.jsx",
+            "frontend/src/game/ui/DialogueBox.test.jsx",
+            "frontend/src/game/ui/WorldMap.jsx",
+            "frontend/src/game/ui/WorldMap.test.jsx",
+            "frontend/src/game/ui/WorldMenu.jsx",
+            "frontend/src/game/ui/WorldMenu.test.jsx",
+            "frontend/src/game/ui/characterLine.js",
+            "frontend/src/game/ui/seenCounts.js",
+            "frontend/src/pages/World.jsx",
+            "frontend/src/pages/World.test.jsx"
+          ],
+          "commit_message": "Overworld V2-D: warp + world map — road-sign travel, WorldMap panel, per-city play",
+          "commit_body": "Road-sign Travel buttons (advance key never travels), WorldMap ow-panel (all cities, grayed empties, growth badges), per-city play + warp choreography, deep-link + failure resilience. Bridge events warp:begin/world:warp/warp:cancel."
+        },
+        {
+          "id": "__GHOST_ID_RESIDENCES__",
+          "title": "V2-I residences",
+          "files": [
+            "frontend/scripts/pixelart/lib/kit-spec.mjs",
+            "frontend/scripts/pixelart/tiles/buildings.mjs",
+            "frontend/scripts/worldgen/landmark-registry.mjs",
+            "frontend/scripts/worldgen/render-sample.mjs",
+            "frontend/scripts/worldgen/suburb.txt",
+            "frontend/scripts/worldgen/templates.config.mjs",
+            "frontend/src/game/assets/art-manifest.json",
+            "frontend/src/game/dialogue/generateDialogue.js",
+            "frontend/src/game/dialogue/generateDialogue.test.js",
+            "frontend/src/game/dialogue/houseSign.js",
+            "frontend/src/game/dialogue/houseSign.test.js",
+            "frontend/src/game/worldgen/assignLots.js",
+            "frontend/src/game/worldgen/caSuburbTemplate.test.js",
+            "frontend/src/game/worldgen/generateWorld.js",
+            "frontend/src/game/worldgen/generateWorld.test.js",
+            "frontend/src/game/worldgen/placeNpcs.js",
+            "frontend/src/game/worldgen/templates/ca-suburb.json",
+            "frontend/src/game/worldgen/templates/template.schema.json"
+          ],
+          "commit_message": "Overworld V2-I: residences — lives_in persons claim houses",
+          "commit_body": "ca-suburb templateVersion 2: 6 house anchor lots, lives_in-only claims, composed house kit (zero new art cells), door dialogue via houseSign.js. Carries D's road-sign edits in the shared generateDialogue.js."
+        }
+      ],
+      "implementers": [
+        {
+          "label": "D-warp",
+          "files": [
+            "frontend/src/game/bridge.js",
+            "frontend/src/game/scenes/WorldScene.js",
+            "frontend/src/game/ui/DialogueBox.jsx",
+            "frontend/src/game/ui/DialogueBox.test.jsx",
+            "frontend/src/game/ui/WorldMap.jsx",
+            "frontend/src/game/ui/WorldMap.test.jsx",
+            "frontend/src/game/ui/WorldMenu.jsx",
+            "frontend/src/game/ui/WorldMenu.test.jsx",
+            "frontend/src/game/ui/characterLine.js",
+            "frontend/src/game/ui/seenCounts.js",
+            "frontend/src/pages/World.jsx",
+            "frontend/src/pages/World.test.jsx"
+          ],
+          "prompt": "Implement V2-D warp + world map per contract §7 (+ §6 banner priority, §3 404/notice, §13 rebuild discipline). Road-sign Tab-reachable 'Travel to <city>' buttons (the advance key must NEVER travel); a NEW WorldMap ow-panel from the pause menu (ALL cities listed, empties grayed with honest unlock copy, home/current markers, counts, per-city basis line, growth badges from a last-VISITED localStorage snapshot cleared on visit, ESC back to menu); 'You're in: {city}' pause row; travel flow (close overlays, 300ms fade / instant under reduced-motion, per-city React Query fetch, first visit spawns at the road-edge sign else persisted position, origin position saved at travel start); resilience (destination fetch failure stays in origin + stale banner, ?city=<bad> routes home + NoticeChip). Bridge events warp:begin/world:warp/warp:cancel. Do NOT edit generateDialogue.js — the I implementer owns it; route your road-sign script through the shared dialogue module it exposes."
+        },
+        {
+          "label": "I-residences",
+          "files": [
+            "frontend/scripts/pixelart/lib/kit-spec.mjs",
+            "frontend/scripts/pixelart/tiles/buildings.mjs",
+            "frontend/scripts/worldgen/landmark-registry.mjs",
+            "frontend/scripts/worldgen/render-sample.mjs",
+            "frontend/scripts/worldgen/suburb.txt",
+            "frontend/scripts/worldgen/templates.config.mjs",
+            "frontend/src/game/assets/art-manifest.json",
+            "frontend/src/game/dialogue/generateDialogue.js",
+            "frontend/src/game/dialogue/generateDialogue.test.js",
+            "frontend/src/game/dialogue/houseSign.js",
+            "frontend/src/game/dialogue/houseSign.test.js",
+            "frontend/src/game/worldgen/assignLots.js",
+            "frontend/src/game/worldgen/caSuburbTemplate.test.js",
+            "frontend/src/game/worldgen/generateWorld.js",
+            "frontend/src/game/worldgen/generateWorld.test.js",
+            "frontend/src/game/worldgen/placeNpcs.js",
+            "frontend/src/game/worldgen/templates/ca-suburb.json",
+            "frontend/src/game/worldgen/templates/template.schema.json"
+          ],
+          "prompt": "Implement V2-I residences per contract §10a-6 + §4c + §11. ca-suburb templateVersion 2: 6 HOUSE anchor lots on a shared suburb_house registry spec, match {kind:'person', basis:'lives_in'} ONLY (works_at/home_default never claim). assignLots person-anchor claims (payload order, one per house, revert on edge removal); claimed houses join model.buildings via the existing sign dispatch; vacant houses get honest city-qualified flavor; residents spawn at their own door. houseSign.js door dialogue wired via a dispatch line in generateDialogue.js (you own that file — also fold in D's road-sign travel edition of buildRoadSignScript so D need not touch it). Composed house kit via the facade path — ZERO new art cells (the buildings sheet's last shelf is closed; appending re-wraps the grid and breaks the frozen hometown.json). Recompile ca-suburb; hometown.json MUST stay byte-identical."
+        }
+      ],
+      "integration_gate_prompt": "Re-bake + double-compile: cd frontend && npm run art && node scripts/worldgen/compile-template.mjs && node scripts/worldgen/compile-template.mjs. hometown.json MUST be byte-identical to HEAD; ca-suburb.json diff = templateVersion 2 + house lots only. Then run the gates below and extend the render proof (render-sample.mjs) to assert 2 lives_in persons claim houses, works_at does not, and C's civic-anchor/ring assertions still pass.",
+      "gate_cmds": [
+        "./scripts/test.sh frontend 2>&1 | tail -6",
+        "(cd frontend && npm run art:check 2>&1 | tail -3)"
+      ],
+      "harden": {
+        "mode": "scoped"
+      }
+    }
+  ]
+}

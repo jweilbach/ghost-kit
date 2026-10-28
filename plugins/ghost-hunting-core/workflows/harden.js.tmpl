@@ -1,0 +1,932 @@
+export const meta = {
+  name: 'harden',
+  description:
+    'Adversarially harden a COMMITTED git range: scoped lens finders → per-finding refuters (adversarial verify, quorum on high severity) → one fixer (every confirmed finding + a regression test each) → an independent fresh-eyes gate. SINGLE PASS, no commit — returns {confirmed, refuted, green, changed_files} so the CALLER commits only the returned files. FAIL-LOUD: if fewer than min_finders (default: all lenses) finders actually return, it returns the abort sentinel {green:false, aborted:true, reason} instead of an empty green — a dead finder wave must never read as a clean range; likewise a finding whose refuters all died — OR whose quorum was only partly reached, because a dead refuter is not a refutation — is KEPT (listed in unverified), never silently refuted, and each dead refuter is retried once first — on a RESTRUCTURED prompt (neutral second-reader framing, no proposed-fix line, no persona), because an identical retry recovered 0 of 5 lost votes on 2026-09-07 when every refuter death was an API safeguard refusal. Returns verify_stats {findings, refuters, died_first, died_retry, recovered, lost, lost_findings} on every path (null before verify ran) — unverified counts findings whose VERDICT changed, so a death beside a surviving upholder is invisible there. GREEN IS EARNED: the gate must report gate_exits (observed exit codes, one per gate; a missing code counts as a failure), and green is REFUSED — with the reasons in green_refusals — on any nonzero gate, on any finding the gate itself judged not-closed, and on any confirmed finding with no resolution. `green: true` is one agent\'s opinion about its own work; the facts overrule it. This is the reusable mechanical half of the plan-first / validate / execute rite cadence. Point it at a wave range AFTER the build is committed. It never touches Ghost Hunting and never calls another workflow — safe to invoke top-level (Workflow tool) or nested. Per-stage model pins (defaults): finder_model fable, verifier_model opus, fixer_model fable, gate_model fable — the fresh-eyes gate is the terminal quorum-less checkpoint reviewing Fable-authored fixes (author-tier parity); refuters stay opus (fan-out + quorum protection). args.model remains a legacy set-all-four override. Effort tiers: find/verify at high, fixer + gate at xhigh. Optional: baseline_red (pre-existing failing test ids — never reported, never "fixed", and not a gate blocker PROVIDED the gate names its failures: a nonzero gate is excused only when its gate_exits entry carries failures[] and every id in it is baseline-red, so an unattributed nonzero still refuses green, and engine-appended gates at engine_gate_from and above are never excusable at all), baseline_red_gates (gates the caller probed as already nonzero-with-no-test-ids on its pre-wave base, as indices into gate_cmds or as raw command strings: such a gate does not refuse green while it still names no ids, and is reported back in inherited_red_gates), no_new_migrations (forbid minting Alembic migrations in fix/gate), min_finders (how many lenses must return before a green verdict is honest; default all), context_notes (a pre-formatted block — e.g. the caller\'s RECALLED IMPRINTS — read by every stage), allowed_files (the caller\'s ownership allow-set; fixer and gate flag out_of_range against it), test_path_re (the caller\'s OWN definition of "test file", shown to the fixer so the in-range exemption it is promised is the set the caller actually exempts, instead of a guess that escalates the wave), strict_range (on a track that HARD-REFUSES an out-of-range fix, the fixer DEFERS such an edit — deferred:true plus the exact instruction in note — rather than making a fix the caller will throw away; returned in deferred_out_of_range, and excluded from the not-closed green refusal since it is unfixed by design), stall_ms (operator passthrough for the harness per-agent stall watchdog on fix+gate — no default; the harness default of 180000ms/5-retries is right for a HEALTHY host, and NO awake stall has ever been observed, so this only widens the window on a flaky link; it does NOT defeat a sleeping host — keeping the host awake is the operator\'s job, and a long Workflow on a sleeping laptop is what orphans the fix/gate stages). Every fix_resolution carries out_of_range + behavior_change (fixer-reported, gate re-verified, OR-ed) and finding_file, so the caller can gate on them instead of committing blind. On a stage death harden now records WHY: fixer_death_reason / gate_death_reason carry the harness\'s thrown message (a stall names itself — "agent stalled on all N attempts (no progress for Xms each)"), folded into reason/green_refusals; and on a fixer death a cheap porcelain read returns tree_delta so the refusal names the N UNATTRIBUTED edits a killed fixer left instead of the false "changed NO files". The fixer and gate prompts also RESUME from a partly-done tree left by an interrupted earlier attempt rather than restarting.',
+  phases: [{ title: 'find' }, { title: 'verify' }, { title: 'fix' }, { title: 'gate' }],
+};
+
+// ── Args (normalized — object | JSON string | undefined; house pattern) ──
+let A = args;
+if (typeof A === 'string') {
+  try {
+    A = JSON.parse(A);
+  } catch (e) {
+    A = {};
+  }
+}
+if (!A || typeof A !== 'object') A = {};
+
+const WT = A.worktree_path || '$(git rev-parse --show-toplevel)';
+const RANGE = A.range;
+if (!RANGE)
+  throw new Error('harden requires args.range (e.g. "b71f6ec..HEAD") (got: ' + JSON.stringify(args) + ')');
+const CONTRACT = A.contract_path || '';
+const MODE = A.mode || 'scoped'; // 'scoped' (3 staff-engineer lenses) | 'panel' (+ product/ux; pass repo persona lenses via args.lenses)
+const FINDER_EFFORT = A.finder_effort || 'high'; // review stages (find + verify) — Opus's "start at high" default; fix/gate keep xhigh
+const FIX_MINORS = A.fix_minors !== false; // fix every confirmed finding by default
+// Default gate: the repo's frontend test command (rendered from .ghost/config.json
+// tests.frontend; may render EMPTY — guarded below). Frontend-only ON PURPOSE: backend tests
+// need a provisioned DATABASE_URL this flow does not create. For a range that touches the
+// backend, PASS gate_cmds with a DB-bearing test command (provision an isolated DB via the
+// repo's configured db script, as the extermination/ghost-lane flows do).
+const TEST_FRONTEND = '__CFG_test_frontend__';
+const DEFAULT_GATES = TEST_FRONTEND ? [`cd "${WT}" && ${TEST_FRONTEND} 2>&1 | tail -6`] : [];
+const GATE_CMDS = Array.isArray(A.gate_cmds) && A.gate_cmds.length ? A.gate_cmds : DEFAULT_GATES;
+// Gates the CALLER probed as already-nonzero-with-no-test-ids on its pre-wave base. A linter that
+// was red before the range existed cannot be evidence about the range, so it must not refuse
+// green here either — fixing only rite-cadence's gate would move the same unpassable wave one
+// phase later, into this workflow. Accepts INDICES into the gate_cmds we were handed (what
+// rite-cadence sends: the two lists are built together, so indices are exact and immune to the
+// {{db_url}} substitution that makes the command text non-comparable) and, for an ad-hoc
+// top-level caller, raw command strings matched against that same list.
+const BASELINE_RED_GATE_IDX = new Set(
+  (Array.isArray(A.baseline_red_gates) ? A.baseline_red_gates : [])
+    .map((v) => (Number.isInteger(v) ? v : GATE_CMDS.indexOf(String(v))))
+    .filter((i) => Number.isInteger(i) && i >= 0),
+);
+const inheritedRedGates = [];
+// Mirrors rite-cadence's predicate and must stay in step with it. POSITIVE, not a blacklist:
+// `code > 0` refuses the -1 this workflow's own gate prompt sanctions for "a gate you did not
+// run" (a budget-capped agent told a gate is excused will rationally skip it and report -1), and
+// `code < 128` refuses 128+N signal deaths — a sibling lane's `pkill -f pytest` gives 143.
+const ranAndReported = (code) =>
+  Number.isInteger(code) && code > 0 && code < 128 && ![124, 126, 127].includes(code);
+const GATE_BLOCK = GATE_CMDS.length
+  ? GATE_CMDS.map((c, i) => `  gate[${i}]: ${c}${BASELINE_RED_GATE_IDX.has(i) ? '   ← INHERITED-RED: already nonzero with NO test ids at the base, BEFORE this range existed. Run it and report its literal exit, but do NOT fix it and do NOT count it against `green` (the engine excuses it). If it starts NAMING failing test ids, that IS new — report them.' : ''}`).join('\n')
+  : '  (NO gate commands configured for this repo and none were passed — skip test gates, run the repo linters on every file you changed, and say so explicitly in your report)';
+
+// Per-stage model pins (approved matrix): author-tier parity for find/fix (reasoning-fable
+// doctrine), opus refuters (fan-out + quorum protection), and a FABLE fresh-eyes gate — it is
+// the terminal, quorum-less checkpoint reviewing the Fable fixer's edits. args.model is a
+// LEGACY override that sets all four when explicitly passed; the per-stage args win over it.
+// No stage inherits the session model. Effort is tiered separately: find/verify at
+// FINDER_EFFORT (high), fix/gate at xhigh.
+const LEGACY = typeof A.model === 'string' && A.model ? A.model : '';
+const FINDER_MODEL = { model: A.finder_model || LEGACY || 'fable' };
+const VERIFIER_MODEL = { model: A.verifier_model || LEGACY || 'opus' };
+const FIXER_MODEL = { model: A.fixer_model || LEGACY || 'fable' };
+const GATE_MODEL = { model: A.gate_model || LEGACY || 'fable' };
+
+// Pre-existing failing tests (from the caller's baseline stage) — inherited red is context,
+// never a finding and never a gate blocker. no_new_migrations: the fixer/gate must never mint
+// a database migration (the caller's migration safety owns that surface).
+const BASELINE_RED = Array.isArray(A.baseline_red) ? A.baseline_red.map(String) : [];
+const NO_NEW_MIGRATIONS = !!A.no_new_migrations;
+
+// Is a nonzero gate's ENTIRE reported failure set inherited baseline-red? Mirrors rite-cadence's
+// helper of the same name, and must stay in step with it: rite-cadence hands this workflow the
+// SAME gate_cmds and the SAME baseline_red, so a divergence here just moves an unpassable wave
+// from the caller's gate phase to this one's. Suffix matching is path-BOUNDARY anchored and
+// DIRECTION-AGNOSTIC because the two sides need not have run through the same command, and the
+// rooting of a test id is decided by the repo's own test script (a `cd backend` inside it makes
+// pytest's rootdir backend/), which is invisible from the gate command handed to us.
+// Index of the first ENGINE-APPENDED gate in gate_cmds, per the caller. Defaults to Infinity so a
+// caller that does not say (an ad-hoc top-level invocation) gets the permissive-but-safe reading:
+// every gate is plan-authored, and the all-ids-must-match rule is the only guard. A linter or a
+// refused-to-run script cannot emit ids that match a baseline anyway.
+const ENGINE_GATE_FROM = Number.isInteger(A.engine_gate_from) ? A.engine_gate_from : Infinity;
+const baselineExcuses = (failures, red) => {
+  const norm = (s) => String(s == null ? '' : s).trim().replace(/^\.\//, '');
+  const reds = (Array.isArray(red) ? red : []).map(norm).filter(Boolean);
+  const got = (Array.isArray(failures) ? failures : []).map(norm).filter(Boolean);
+  if (!reds.length || !got.length) return false;
+  return got.every((f) => reds.some((r) => f === r || f.endsWith('/' + r) || r.endsWith('/' + f)));
+};
+
+// Caller-supplied context (both optional; rite-cadence passes them per wave).
+//   context_notes — a pre-formatted block (the wave's RECALLED IMPRINTS) that every finder,
+//                   refuter, fixer and gate reads, so the hunt starts with the repo's known
+//                   traps in hand instead of rediscovering them.
+//   allowed_files — the caller's ownership allow-set (declared ∪ this wave's migration ∪
+//                   reconcile-swept). The fixer and gate flag out_of_range against the SAME set
+//                   the caller gates on. Without it the fixer's own notion of "the range"
+//                   (git diff --name-only) diverges from the engine's, and a regression test
+//                   added to an existing test file the build never touched reads as out of range.
+// 16000 must equal rite-cadence's RECALL_BLOCK_MAX. It is the SAME block — the caller composes the
+// wave's RECALLED IMPRINTS to its cap and passes it here, so a smaller cap on this side silently
+// re-cuts it. That is how A4's over-truncation came back across the seam: the caller was raised to
+// 12000 and this stayed at 8000, so every finder, fixer and gate read the Coven's memory cut off
+// mid-sentence. Trim by whole LINES for the same reason the caller does — a block ending in half a
+// gotcha reads as a corrupted instruction, not a shortened list. The test pins the two numbers.
+const CONTEXT_NOTES_MAX = 16000;
+const CONTEXT_NOTES = (() => {
+  if (typeof A.context_notes !== 'string') return '';
+  const t = A.context_notes.trim();
+  if (t.length <= CONTEXT_NOTES_MAX) return t;
+  const kept = [];
+  let size = 0;
+  for (const l of t.split('\n')) {
+    if (size + 1 + l.length > CONTEXT_NOTES_MAX) break;
+    kept.push(l);
+    size += 1 + l.length;
+  }
+  return kept.join('\n');
+})();
+const ALLOWED_FILES = Array.isArray(A.allowed_files) ? A.allowed_files.map(String).filter(Boolean) : [];
+// strict_range — the caller HARD-REFUSES an out-of-range fix on this track (backend waves), so
+// making the edit cannot ship it; it only costs the wave. Under strict_range the fixer DEFERS such
+// an edit with the exact instruction instead. Default off: on a track that commits-and-flags,
+// making the fix is the better outcome.
+const STRICT_RANGE = !!A.strict_range;
+// stall_ms — operator passthrough for the harness's per-agent stall watchdog on the two longest,
+// single-shot stages (fix + gate). NO default: the harness default (er = 180000ms of no stream
+// progress, 5 retries) is correct for a HEALTHY host, and every awake stall observed to date was
+// zero — a 300s+ default would only make a genuinely hung agent cost 6× longer to abort. This does
+// NOT defeat a sleeping host (the wall-clock keeps advancing while the process is suspended, so any
+// finite watchdog trips): keeping the host awake is the operator's job, documented in the prompt
+// preamble below. This knob exists only so an operator on a flaky link can widen the window without
+// forking the engine. A non-positive or non-numeric value is ignored (falls back to the default).
+const STALL_MS = (typeof A.stall_ms === 'number' || (typeof A.stall_ms === 'string' && A.stall_ms.trim()))
+  && Number(A.stall_ms) > 0 ? Number(A.stall_ms) : null;
+const STALL_OPT = STALL_MS ? { stallMs: STALL_MS } : {};
+// test_path_re — the CALLER's definition of "test file", so the exemption the fixer is told about
+// ("a new regression test file is in range by definition") is the same set the caller exempts.
+// Without it the fixer guesses, and an honest guess that the caller's regex did not share
+// escalated the wave. Prose, not a live RegExp: this is only ever shown to an agent.
+const TEST_PATH_NOTE = typeof A.test_path_re === 'string' && A.test_path_re
+  ? `A path counts as a TEST FILE (and is therefore in range) when it matches this regex, which is the caller's own definition — not your judgement: ${A.test_path_re}\n`
+  : '';
+
+// Custom lenses override the defaults entirely: [{ key, agentType, focus }].
+const CUSTOM_LENSES = Array.isArray(A.lenses) && A.lenses.length ? A.lenses : null;
+
+// Minimum finders that must actually RETURN before any green verdict is honest. Default: all
+// of them — an empty finding set only means "clean" if every lens ran. See the abort below.
+// Only an explicit number (or numeric string) lowers the bar; null/''/garbage → default.
+const MIN_FINDERS_RAW =
+  (typeof A.min_finders === 'number' || (typeof A.min_finders === 'string' && A.min_finders.trim()))
+    ? Number(A.min_finders)
+    : NaN;
+
+// ── Schemas ──
+const FINDINGS = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    findings: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          title: { type: 'string' },
+          file: { type: 'string' },
+          line: { type: 'number' },
+          severity: { type: 'string', enum: ['blocker', 'major', 'minor'] },
+          description: { type: 'string' },
+          fix_sketch: { type: 'string' },
+        },
+        required: ['title', 'file', 'severity', 'description', 'fix_sketch'],
+      },
+    },
+  },
+  required: ['findings'],
+};
+const VERDICT = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    real: { type: 'boolean' },
+    // NAMED `evidence`, NOT `reasoning`. Every one of the 20 refuter deaths on 2026-09-07 came
+    // back as `safeguards flagged this message ... Details: [reasoning_extraction]`, and this is
+    // the ONLY schema in the plugin with a field called `reasoning` (grep the templates). The
+    // Workflow tool appends a StructuredOutput instruction naming every field to the system
+    // prompt, so that token was present on the dying stage and on no other. That is a
+    // correlation, not a proven cause — 29 of 40 same-schema calls survived — but it costs six
+    // lines to remove and the next run's died_first rate is a clean read on whether it mattered.
+    evidence: { type: 'string' },
+    revised_severity: { type: 'string', enum: ['blocker', 'major', 'minor', 'not-a-bug'] },
+  },
+  required: ['real', 'evidence', 'revised_severity'],
+};
+const FIX_REPORT = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    resolutions: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          finding: { type: 'string' },
+          files: { type: 'string' },
+          test_added: { type: 'string' },
+          note: { type: 'string' },
+          // Safety flags the CALLER gates on (see the fixer prompt for the definitions). Required:
+          // an omitted flag would read as "safe", which is the blind-commit failure this closes.
+          out_of_range: { type: 'boolean' },
+          behavior_change: { type: 'boolean' },
+          // strict_range only: the fix was NOT made because it needed an out-of-range edit; `note`
+          // carries the exact instruction. Deliberately NOT required — an older fixer report, or
+          // a run with strict_range off, omits it and reads as false, which is the truth there.
+          deferred: { type: 'boolean' },
+        },
+        required: ['finding', 'files', 'test_added', 'out_of_range', 'behavior_change'],
+      },
+    },
+    changed_files: { type: 'array', items: { type: 'string' } },
+    gates_green: { type: 'boolean' },
+    ambiguities: { type: 'string' },
+  },
+  required: ['resolutions', 'changed_files', 'gates_green'],
+};
+const GATE = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    green: { type: 'boolean' },
+    per_finding: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          finding: { type: 'string' },
+          verdict: { type: 'string', enum: ['closed', 'partial', 'not-closed'] },
+          // Independent re-verification of the fixer's flags (same definitions).
+          out_of_range: { type: 'boolean' },
+          behavior_change: { type: 'boolean' },
+        },
+        required: ['finding', 'verdict', 'out_of_range', 'behavior_change'],
+      },
+    },
+    new_defects: { type: 'string' },
+    out_of_scope_hunks: { type: 'string' },
+    // WHY A DEDICATED FIELD instead of parsing the prose above. When `green` is false the caller
+    // must be able to tell the human WHY, and the two fields above are written as prose for a
+    // human — "NO new defects.", "NONE." — so keying off them means regexing English. A first
+    // attempt did exactly that and inverted itself: "No new defects, BUT the fix reverts the guard"
+    // matched a /^no/ clean-report filter and was DROPPED, while "Nothing new." survived and was
+    // quoted back as the cause. Ask for the reason directly instead.
+    green_reason: { type: 'string' },
+    changed_files: { type: 'array', items: { type: 'string' } },
+    totals: { type: 'string' },
+    // OBSERVED FACTS, not a verdict — the same split rite-cadence enforces on its own integration
+    // gate: "`green` is the agent's VERDICT; gate_exits are OBSERVED FACTS. The engine trusts the
+    // facts. A gate that refused to run (nonzero exit) must never read as a gate that passed —
+    // pg-smoke exited 4 on every backend wave in one consumer repo while this stage kept returning green."
+    // That rule was never applied HERE, and rite-cadence hands this gate the very same
+    // engine-appended pg-smoke and migration-gate commands, then trusted a bare boolean.
+    gate_exits: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        // `failures` (v1.7.3): which tests a NONZERO gate actually failed on, so the engine can
+        // tell an inherited baseline-red from a regression this range introduced. Optional by
+        // design — omitting it on a nonzero gate falls back to blocking, never to an excuse.
+        properties: { index: { type: 'integer' }, exit_code: { type: 'integer' }, failures: { type: 'array', items: { type: 'string' } } },
+        required: ['index', 'exit_code'],
+      },
+    },
+  },
+  required: ['green', 'changed_files', 'totals', 'gate_exits'],
+};
+// Porcelain read used ONLY on a fixer death: harden runs in a no-fs sandbox, so the only way to
+// learn whether a killed fixer left a DIRTY tree (edits with no report) is to ask an agent to read
+// git. Without it the fixer-died refusal said "changed NO files" over a dirty tree — the false tell
+// that sent this ghost's author down the structural path.
+const REALIZED = {
+  type: 'object',
+  additionalProperties: false,
+  properties: { paths: { type: 'array', items: { type: 'string' } } },
+  required: ['paths'],
+};
+
+// ── Shared preamble (no Ghost Hunting auth — review-only) ──
+const COMMON = `You are hardening a COMMITTED git range in the __CFG_repo__ repo.
+WORKING TREE: ${WT}. RANGE: ${RANGE} (assumed linear — ext/* branches do not merge). Get the diff with: git -C ${WT} diff ${RANGE} -- <paths>.
+${CONTRACT ? `BINDING CONTRACT: ${CONTRACT} — read the sections relevant to the diff before the code.\n` : ''}Honor the repo's documented invariants (CLAUDE.md and the docs it points to — event/write discipline, tenancy scoping, determinism rules, RBAC tiers, whatever the repo declares) where they apply.
+${CONTEXT_NOTES ? CONTEXT_NOTES + '\n' : ''}${ALLOWED_FILES.length ? `RANGE ALLOW-SET (the caller's ownership set for this range): ${ALLOWED_FILES.join(', ')} — a fix that touches a path outside this set AND outside the range's own changed files is OUT OF RANGE unless it is a test file.\n` : ''}${BASELINE_RED.length ? `BASELINE-RED (pre-existing failures on the untouched base — inherited, NOT caused by this range): ${JSON.stringify(BASELINE_RED)}. Never report these as findings, never "fix" them, and a gate red confined to these ids is NOT a blocker; only NEW reds count.\n` : ''}${NO_NEW_MIGRATIONS ? `MIGRATION DISCIPLINE: NEVER CREATE a new database migration (the migration CLI create/revision and hand-writing a new file under a migrations versions/ directory are FORBIDDEN); if schema drift appears, report it as a finding instead. You MAY minimally FIX a migration file that already exists in this range — the caller expects that and re-proves reversibility afterwards; creating a NEW one is what is forbidden.\n` : ''}Report ONLY defects you can argue concretely (wrong output, crash, state corruption, contract/honesty violation, determinism break). No style nits.
+Severity: blocker = wrong/corrupting behavior a user hits; major = real defect in an edge path; minor = latent hazard.`;
+
+// ── Lens sets ──
+const SCOPED_LENSES = [
+  {
+    key: 'async-state',
+    agentType: 'ghost-hunting-core:staff-engineer',
+    focus:
+      'Async / state / races / lifecycle: request races, stale closures, effect ordering, cross-component state desync, resources released on unmount/teardown, error/loading/empty paths, event-ordering and dropped-event hazards.',
+  },
+  {
+    key: 'data-persistence',
+    agentType: 'ghost-hunting-core:staff-engineer',
+    focus:
+      'Data / persistence / determinism: persisted-state correctness & migration, validation/round-trip, dedup & identity, cross-class key collisions, determinism of generated/derived output, off-by-one and capacity/threshold math.',
+  },
+  {
+    key: 'seam-regression',
+    agentType: 'ghost-hunting-core:staff-engineer',
+    focus:
+      'Cross-seam & regression: how the new code composes with code it touches but did not change; behavior changes on shared paths; anything the diff could break in an adjacent already-shipping feature; test-honesty (tests asserting mocks rather than behavior).',
+  },
+];
+// Panel extras are the shared plugin lenses only. Repo persona agents (e.g. user-merchant,
+// power-user) live in each repo's .claude/agents/ — pass them via args.lenses to include them.
+const PANEL_EXTRA = [
+  {
+    key: 'product',
+    agentType: 'ghost-hunting-core:product-manager',
+    focus: 'Scope/value: dead surface, over-engineering, whether the change earns its complexity for this product and its users.',
+  },
+  {
+    key: 'ux',
+    agentType: 'ghost-hunting-core:senior-ux',
+    focus: 'Usability, information hierarchy, error/empty/loading states, accessibility, copy — on any user-facing surface in the diff.',
+  },
+];
+const LENSES = CUSTOM_LENSES || (MODE === 'panel' ? SCOPED_LENSES.concat(PANEL_EXTRA) : SCOPED_LENSES);
+const agentTypeFor = (key) => {
+  const l = LENSES.find((x) => x.key === key);
+  return l ? l.agentType : 'ghost-hunting-core:staff-engineer';
+};
+const MIN_FINDERS = Number.isFinite(MIN_FINDERS_RAW)
+  ? Math.max(0, Math.min(LENSES.length, Math.trunc(MIN_FINDERS_RAW)))
+  : LENSES.length;
+
+// ── Phase: find ── (lens key attached INSIDE the thunk so a null finder never misaligns indices)
+phase('find');
+if (!GATE_CMDS.length) log('harden: no gate_cmds passed and no frontend test command configured (tests.frontend empty) — test gates will be SKIPPED; fixer/gate fall back to lint-only verification');
+const finderResults = await parallel(
+  LENSES.map((l) => () =>
+    agent(
+      `${COMMON}
+
+LENS: ${l.key}. Focus your hunt on: ${l.focus}
+Read the full diff for the range, plus any adjacent unchanged code the diff composes with. Return every concrete defect you can argue.`,
+      { label: `find:${l.key}`, phase: 'find', agentType: l.agentType, schema: FINDINGS, effort: FINDER_EFFORT, ...FINDER_MODEL },
+    )
+      // Without this, ONE throwing lens rejects the whole Promise.all and kills the workflow —
+      // and everything below written to handle a dead finder (liveFinders, deadLenses,
+      // MIN_FINDERS, the abort sentinel) is unreachable for exactly the case it exists for, while
+      // the comment beneath claims a dead finder "resolves to null". Nothing made it. The
+      // refuters, the fixer and the gate each got this containment; the finders were missed twice.
+      // Keep the thrown reason (a stall/quota death names itself) so the abort sentinel can say WHY
+      // a lens is missing instead of only that it is.
+      .then((res) => ({ key: l.key, res, dead: '' }))
+      .catch((e) => ({ key: l.key, res: null, dead: String((e && e.message) || '').slice(0, 200) })),
+  ),
+);
+
+// LIVENESS FIRST — a dead finder (harness death, terminal API error after retries) resolves to
+// null, and a null finder is indistinguishable from a clean one once the findings are flattened.
+// "Everything came back empty" must therefore NEVER short-circuit to green until we know the
+// lenses actually RAN. Below MIN_FINDERS live results we return a loud abort sentinel instead
+// (green:false, aborted:true) so the caller fails the wave rather than shipping it unreviewed.
+const liveFinders = finderResults.filter((r) => r && r.res && Array.isArray(r.res.findings));
+const deadLenses = LENSES.filter((l) => !liveFinders.some((r) => r.key === l.key)).map((l) => l.key);
+// A dead finder that THREW carries its reason (a stall names itself); one that resolved to a
+// non-findings shape does not. Name the causes we have so a sleep/quota abort is legible.
+const finderDeathReasons = finderResults.filter((r) => r && r.dead).map((r) => `${r.key}: ${r.dead}`);
+if (liveFinders.length < MIN_FINDERS) {
+  const reason = `finder(s) died: only ${liveFinders.length}/${LENSES.length} lens(es) returned a result (need ${MIN_FINDERS}); no result from [${deadLenses.join(', ')}]`
+    + (finderDeathReasons.length ? ` — ${finderDeathReasons.join(' ; ').slice(0, 300)}` : '');
+  log(`harden ABORT — ${reason}`);
+  return {
+    green: false,
+    aborted: true,
+    reason,
+    dead_lenses: deadLenses,
+    // NULL, not a zeroed record: the verify stage never ran, and {refuters: 0, lost: 0} would read
+    // to the caller (and to any future rate tracker) as a wave that lost no refuters.
+    verify_stats: null,
+    confirmed: [],
+    refuted: [],
+    changed_files: [],
+    fix_resolutions: [],
+    gate: null,
+    note: 'ABORTED before the review completed — this range is UNREVIEWED. An empty finding list here means the finders never reported, NOT that the range is clean.',
+  };
+}
+if (deadLenses.length)
+  log(`find: WARNING — ${deadLenses.length} lens(es) returned nothing (${deadLenses.join(', ')}); min_finders=${MIN_FINDERS} still satisfied, so coverage is PARTIAL`);
+
+const rawFindings = liveFinders
+  .flatMap((r) => r.res.findings.map((f) => ({ ...f, lens: r.key })));
+
+// Conservative dedup: EXACT (file|line|title) only — favors KEEPING distinct findings.
+// (Two lenses reporting one bug under different titles → two refuters, acceptable waste; never
+//  drop a distinct real finding, which would defeat the whole pass.)
+const seen = new Set();
+const deduped = [];
+for (const f of rawFindings) {
+  const key = `${f.file}|${f.line || ''}|${String(f.title || '').trim().toLowerCase()}`;
+  if (seen.has(key)) continue;
+  seen.add(key);
+  deduped.push(f);
+}
+log(`find: ${rawFindings.length} raw → ${deduped.length} after exact-dedup`);
+
+if (!deduped.length) {
+  return {
+    verify_stats: null,
+    confirmed: [],
+    refuted: [],
+    green: true,
+    aborted: false,
+    dead_lenses: deadLenses,
+    changed_files: [],
+    fix_resolutions: [],
+    gate: null,
+    note: `no findings — range is clean under ${liveFinders.length}/${LENSES.length} lens(es) that reported`,
+  };
+}
+
+// Duplicates across lenses are ACCEPTED, deliberately. Three lenses reporting one defect three
+// ways costs extra refuters (which run in parallel, so it is near-free) and some noise in the
+// report. 1.6.1 briefly added an agent that grouped findings by root cause; it was removed after
+// review. Its two measurable benefits did not survive scrutiny — the refuter cost is parallel, and
+// the "duplicates crowd the writeback budget" problem was really an unsorted slice, fixed in the
+// caller by sorting candidates by severity before capping. What remained was a merge that could
+// silently drop a real defect: a wrongly grouped finding takes one refutation to kill every
+// symptom at once. For an engine whose entire job is to not miss things, that trade is backwards.
+// Exact-dedup (file|line|title, above) stays: it is mechanical and cannot be wrong.
+
+// ── Phase: verify ── (adversarial refuters; quorum for high severity)
+phase('verify');
+// blocker/major → 2 refuters (keep unless BOTH refute); minor → 1. parallel() auto-queues past
+// the concurrency cap, so a large fan-out is fine.
+// ONE definition of the quorum size, used by the fan-out below AND by the tally that decides
+// whether a quorum was actually reached. Two copies of this rule is how "keep unless the WHOLE
+// quorum refutes" quietly became "refute on whoever survived".
+const expectedVoters = (f) => (f && f.severity === 'minor' ? 1 : 2);
+const verifyTasks = [];
+deduped.forEach((f, fi) => {
+  for (let r = 0; r < expectedVoters(f); r++) verifyTasks.push({ f, fi, r });
+});
+// TWO refuter prompts, and the divergence is DELIBERATE — read the retry's comment before
+// "restoring" the single-prompt shape this replaced.
+const verifyPrompt = (t) => `${COMMON}
+
+You are an ADVERSARIAL VERIFIER (refuter ${t.r + 1}). A reviewer claims this defect in the range. Try to REFUTE it by reading the actual code (and contract) — reviewers miss guards, test pins, and contract clauses. Uphold (real=true) ONLY if you can trace the concrete failure yourself; put the guard, test pin, contract clause or the concrete failing input in evidence. If it is a deliberate, documented, contract-compliant decision, refute it (real=false). If real but the severity is inflated, keep real=true and lower revised_severity.
+CLAIM (lens ${t.f.lens}):
+title: ${t.f.title}
+file: ${t.f.file}${t.f.line ? ' ~line ' + t.f.line : ''}
+severity: ${t.f.severity}
+description: ${t.f.description}
+proposed fix: ${t.f.fix_sketch}`;
+// THE RETRY IS A DIFFERENT DRAW, because an identical one is worthless. On 2026-09-07 twenty
+// refuters died to API safeguard refusals and EVERY retry died too (5/5). The Workflow harness
+// already retries internally before handing back null, so the engine's retry was the THIRD
+// identical attempt — at an independent 15% that is ~8e-5, so the refusal is per-prompt
+// DETERMINISTIC and the old comment's "sometimes happens, implying it is not deterministic" was
+// wrong. The retry therefore varies every dimension we own and cost nothing: neutral second-reader
+// framing instead of "ADVERSARIAL VERIFIER ... state the exact inputs/sequence", no `proposed fix:`
+// line, and no agentType (the fixer and gate spawn without one and never died).
+// It is slightly less adversarial than the first attempt. That is the right trade: the alternative
+// is losing the vote entirely, and a lost vote means the fixer works on an unadjudicated finding.
+const verifyPromptRetry = (t) => `${COMMON}
+
+You are an independent second reader. Another reviewer claims the defect below exists in this range. Decide whether it is real by reading the actual code and contract — reviewers miss guards, test pins and contract clauses. Set real=true only if the code supports the claim, and put the guard, test pin, contract clause or concrete failing input in evidence. If it is a deliberate, documented, contract-compliant decision, set real=false. If it is real but the severity is inflated, keep real=true and lower revised_severity.
+CLAIM (lens ${t.f.lens}):
+title: ${t.f.title}
+file: ${t.f.file}${t.f.line ? ' ~line ' + t.f.line : ''}
+severity: ${t.f.severity}
+description: ${t.f.description}`;
+const verifyOpts = (t, suffix) => ({ label: `verify:${t.fi}.${t.r}${suffix}`, phase: 'verify', agentType: agentTypeFor(t.f.lens), schema: VERDICT, effort: FINDER_EFFORT, ...VERIFIER_MODEL });
+const verifyOptsRetry = (t) => ({ label: `verify:${t.fi}.${t.r}.retry`, phase: 'verify', schema: VERDICT, effort: FINDER_EFFORT, ...VERIFIER_MODEL });
+const verdicts = await parallel(
+  verifyTasks.map((t) => () =>
+    agent(verifyPrompt(t), verifyOpts(t, ''))
+      // ONE retry on a dead refuter, before the quorum has to reason about a missing vote — on the
+      // RESTRUCTURED prompt above. `attempts` is recorded so the run can report how many draws it
+      // lost: `unverified` counts findings whose VERDICT was affected, so a death beside a
+      // surviving upholder is invisible there, which is why 11/40 was knowable only by reading
+      // task notifications by hand. If the retry dies too the fail-loud paths below take over — a
+      // lost vote is NEVER silently treated as a refutation.
+      .catch(() => null)
+      .then(async (v) => (v
+        ? { fi: t.fi, v, attempts: 1 }
+        : { fi: t.fi, v: await agent(verifyPromptRetry(t), verifyOptsRetry(t)).catch(() => null), attempts: 2 })),
+  ),
+);
+
+// THE DEATH RATE AS A NUMBER. `unverified` (below) lists findings whose VERDICT was affected, so a
+// refuter that died beside a surviving upholder leaves no trace in it — which is why "11 of 40
+// refuters died" on 2026-09-07 was only knowable by reading task notifications by hand, and why the
+// log line below undercounted. These are draws, not findings. `lost_findings` names at most 20 so a
+// wave that lost a whole quorum can be recognised without opening a payload.
+const verifyStats = (() => {
+  const died_first = verdicts.filter((x) => x.attempts === 2).length;
+  const lostTasks = verdicts.filter((x) => !x.v);
+  const lostFi = new Set(lostTasks.map((x) => x.fi));
+  return {
+    findings: deduped.length,
+    refuters: verdicts.length,
+    died_first,
+    died_retry: lostTasks.length,
+    recovered: died_first - lostTasks.length,
+    lost: lostTasks.length,
+    lost_findings: [...lostFi].slice(0, 20).map((fi) => String((deduped[fi] && deduped[fi].title) || '?').slice(0, 80)),
+  };
+})();
+if (verifyStats.lost || verifyStats.died_first)
+  log(`verify: ${verifyStats.refuters} refuter(s), ${verifyStats.died_first} died on the first draw, ${verifyStats.recovered} recovered on the restructured retry, ${verifyStats.lost} LOST`);
+
+// Aggregate per finding: KEPT unless the whole quorum refutes (keep-on-tie — a hardening pass
+// must not lose a real blocker to one over-zealous vote).
+const byFinding = new Map();
+for (const r of verdicts.filter(Boolean)) {
+  if (!byFinding.has(r.fi)) byFinding.set(r.fi, []);
+  byFinding.get(r.fi).push(r.v);
+}
+const sevOrder = { blocker: 3, major: 2, minor: 1 };
+const confirmed = [];
+const refuted = [];
+const unverified = [];
+deduped.forEach((f, fi) => {
+  const vs = (byFinding.get(fi) || []).filter(Boolean);
+  const upholding = vs.filter((v) => v.real && v.revised_severity !== 'not-a-bug');
+  if (upholding.length) {
+    const best = upholding.map((v) => v.revised_severity).sort((a, b) => (sevOrder[b] || 0) - (sevOrder[a] || 0))[0] || f.severity;
+    confirmed.push({ ...f, severity: best, verifier: upholding[0].evidence || '' });
+  } else if (!vs.length) {
+    // Every refuter assigned to this finding DIED. Silence is not a refutation — the same
+    // empty-result hazard as a dead finder. Keep it (a wasted fix costs less than an
+    // unexamined defect) and mark it so the fixer/gate know it was never adjudicated.
+    unverified.push({ title: f.title, file: f.file });
+    confirmed.push({ ...f, verifier: 'UNVERIFIED — every refuter for this finding died; kept by fail-loud policy' });
+  } else if (vs.length < expectedVoters(f)) {
+    // PARTIAL quorum, no upholder. The stated policy two comments up is "KEPT unless the WHOLE
+    // quorum refutes (keep-on-tie)" — and half a quorum is not the whole quorum. Refuting here
+    // would let one dead agent decide a major finding, which is the same deceptive-silence class
+    // as the all-died case immediately above; that one was made fail-loud and this one was missed.
+    // Live evidence: two Opus refuters died to API safeguards on 2026-09-05, ~3% of ~70 calls, so
+    // the [DEAD, refute] shape is reachable on any run.
+    unverified.push({ title: f.title, file: f.file, partial: true });
+    confirmed.push({ ...f, verifier: `PARTIALLY VERIFIED — ${expectedVoters(f) - vs.length}/${expectedVoters(f)} refuter(s) died and the survivor refuted; kept by keep-on-tie` });
+  } else {
+    refuted.push({ title: f.title, file: f.file, why: (vs[0] && vs[0].evidence) || 'refuted' });
+  }
+});
+log(
+  `verify: ${confirmed.length} confirmed / ${refuted.length} refuted` +
+    (unverified.length ? ` (${unverified.length} kept UNVERIFIED — refuters died)` : ''),
+);
+
+if (!confirmed.length) {
+  return { confirmed: [], refuted, green: true, aborted: false, dead_lenses: deadLenses, verify_stats: verifyStats, changed_files: [], fix_resolutions: [], gate: null, note: 'all findings refuted — nothing to fix' };
+}
+
+const toFix = FIX_MINORS ? confirmed : confirmed.filter((f) => f.severity !== 'minor');
+const deferred = FIX_MINORS ? [] : confirmed.filter((f) => f.severity === 'minor');
+
+// ── Phase: fix ── (one fixer, deterministic order, per-finding resolution record)
+phase('fix');
+const fixOrder = toFix
+  .slice()
+  .sort((a, b) => (a.file + String(a.line || 0)).localeCompare(b.file + String(b.line || 0)));
+const findingsBlock = fixOrder
+  .map(
+    (f, i) =>
+      `[${i + 1}] (${f.severity}) ${f.file}${f.line ? ':' + f.line : ''} — ${f.title}\n    ${f.description}\n    fix: ${f.fix_sketch}`,
+  )
+  .join('\n');
+
+// A stage death (harness abort, stall watchdog, terminal API error after retries) surfaces here as
+// a thrown error — the message NAMES the cause (a stall throws "agent stalled on all N attempts (no
+// progress for Xms each)"). Capture it: the old `.catch(() => null)` discarded that string, which is
+// exactly why a sleep-killed run once read as "no recorded cause". null is still the contract for the
+// death guards below; we only keep the reason alongside it.
+let fixerDeathReason = '';
+let gateDeathReason = '';
+const fix = await agent(
+  `${COMMON}
+
+You are the FIXER. Implement EVERY finding below, in the given deterministic file order. Work in ${WT}. Do NOT commit.
+Where findings touch the same file/region, resolve them coherently — one edit must not silently undo another. Give EACH finding a regression test unless genuinely untestable in this stack (say so explicitly). Keep edits minimal — no refactors beyond the fix. Do NOT touch files unrelated to the findings.
+RESUME, DO NOT RESTART: a previous attempt of THIS SAME task may have been interrupted mid-run (host slept, harness stall, transient API error), so the tree may ALREADY carry some of these fixes. FIRST run git -C ${WT} status --porcelain; treat any pending edits as your own in-progress work — read them, verify each against its finding, and CONTINUE from there. Do not blindly redo a finding whose fix is already present and correct; only report it as resolved once you have confirmed it.
+FINDINGS:
+${findingsBlock}
+
+Before editing, run: git -C ${WT} diff --name-only ${RANGE}  — that list${ALLOWED_FILES.length ? ' plus the RANGE ALLOW-SET above' : ''} is the IN-RANGE set.
+${TEST_PATH_NOTE}${STRICT_RANGE ? `STRICT RANGE IS ON. If closing a finding REQUIRES an edit outside the in-range set that is not a test file, do NOT make that edit. Record the resolution with deferred: true, files: "", and put the exact edit that is needed — path, and what to change — in note. Then move on to the next finding. Rationale: on this track the caller REFUSES an out-of-range fix and leaves the whole fix set uncommitted, so making the edit does not ship it; it only costs the wave. Deferring lands everything else and hands the human a precise one-line instruction.
+` : ''}DOC RULE: a finding whose file is a doc (.md/.mdx/.rst/.txt, or under docs/) is fixed ONLY in doc files. Never mirror corrected prose into code comments or docstrings in the same resolution — the caller escalates a doc finding whose fix touched a runtime file, and it cannot tell a comment from a dispatch. If a code comment is also wrong, say so in ambiguities and leave it.
+For EACH resolution report two flags HONESTLY (the caller gates on them; a wrong "false" ships an unexamined change):
+- out_of_range: true if the fix edited ANY file outside the in-range set that is not a test file (a new regression test file is in range by definition).
+- behavior_change: true ONLY if the fix changes runtime behaviour BEYOND what closing the finding requires — a new code path, a changed default, a side effect the finding did not ask for. "The bug is now fixed" is NOT a behavior change; do not flag every fix.
+Name each resolution by its finding index and title exactly as listed above (e.g. "[2] Stale closure in …").
+Then run these gates and make them green (fix any red you introduce):
+${GATE_BLOCK}
+Also run eslint/ruff on the files you changed (0 new errors).
+Return: per-finding resolution (files:lines + the test you added + the two flags), the full changed_files list, whether the gates are green, and any ambiguity.`,
+  { label: 'fix', phase: 'fix', schema: FIX_REPORT, effort: 'xhigh', ...FIXER_MODEL, ...STALL_OPT },
+// A harness death here used to kill the whole workflow, discarding the completed finder wave and
+// the entire refuter quorum — the most expensive stages of the run — and the caller then reported
+// "harden CHILD WORKFLOW CRASHED, no review happened at all", which is the opposite of the truth.
+// null is already the contract: `fixerDied` and the null-gate refusals below were written for it
+// and were unreachable dead code until now. Keep the thrown message: it is the durable record of
+// WHY (a stall names itself; a quota/skip death is the harness's generic "produced no result").
+).catch((e) => { fixerDeathReason = String((e && e.message) || '').slice(0, 300); return null; });
+
+// ── Phase: gate ── (independent fresh-eyes verification; may fix reds, self-verified by the suite)
+phase('gate');
+const gate = await agent(
+  `${COMMON}
+
+You are the FRESH-EYES GATE (independent of the fixer). Uncommitted fixer changes sit on top of ${RANGE} in ${WT}. Do NOT commit.
+RESUME, DO NOT RESTART: a previous attempt of THIS SAME gate may have been interrupted (host slept, harness stall, transient API error), so a partial re-run of the gates may already be in the tree. Run git -C ${WT} status --porcelain first and continue from the current state rather than reverting or redoing work already present.
+Fixer report:
+${fix ? String(JSON.stringify(fix)).slice(0, 12000) : 'MISSING'}
+Original confirmed findings:
+${findingsBlock}
+
+1. git -C ${WT} status --short && git -C ${WT} diff — read the WHOLE diff. Flag any hunk OUTSIDE the findings' scope (out_of_scope_hunks); do not silently accept it.
+2. For EACH finding: re-trace the original failure against the NEW code and judge closed / partial / not-closed. INDEPENDENTLY re-verify the fixer's two flags and report your own: out_of_range (the fix edited a file outside git diff --name-only ${RANGE}${ALLOWED_FILES.length ? ' and outside the RANGE ALLOW-SET' : ''} that is not a test file) and behavior_change (runtime behaviour changed BEYOND what closing the finding required — not merely "the bug is fixed"). Name each per_finding entry by the finding's index and title exactly as listed.
+3. Hunt NEW defects the fixes introduce (interactions, a fix masking another finding, over-broad edits).
+4. Re-run the gates:
+${GATE_BLOCK}
+   plus eslint/ruff on changed files. If a gate is RED because of something the fixer left broken, you may make a MINIMAL fix and RE-RUN until green (the green suite verifies your edit) — but never touch anything outside the findings' scope; if you cannot fix it cleanly, leave it red and report.
+   REPORT THE EXIT CODE OF EVERY GATE in gate_exits, as {index, exit_code}, one entry per gate[i] above, from its FINAL run. Capture it literally — run the command, then read $? — never infer it from the output text: a gate that refuses to run can print reassuring text and still exit nonzero, and that is the exact case this field exists to catch. A gate you did not run is exit_code -1, not an omission.
+   ON ANY NONZERO GATE also set that entry's failures: EVERY failing test id from its final run, in the exact form the suite prints (pytest "path/to/test_x.py::test_y", the frontend runner "file > test name"). Another FACT, not a judgment — list what failed and let the engine rule on it. Do not summarize, do not abbreviate a second id to "::name" form, and do not leave the ids only in prose: the engine reads failures, never your notes. A nonzero gate whose failures are ALL baseline-red is excused; one that names nothing, or names a single id outside baseline-red, REFUSES green. A gate red for a reason with no test ids at all (a linter, a compile error, a script that refused to run) should report its nonzero exit with no failures list — that is a genuine blocker, UNLESS its line above is marked INHERITED-RED.
+5. Report: green true/false; per-finding verdict; new defects; out-of-scope hunks; the final changed_files list; suite totals; gate_exits.
+   IF green IS FALSE you MUST also set green_reason: ONE sentence, in your own words, naming the
+   finding or the defect that makes it false. This string is quoted VERBATIM to the human as the
+   reason the wave stopped, and it is the ONLY thing that tells them whether the fix set is worth
+   keeping — the engine will not parse your prose fields to guess it. Never write a summary of
+   clean results there; if nothing is wrong, green is true.`,
+  { label: 'gate', phase: 'gate', schema: GATE, effort: 'xhigh', ...GATE_MODEL, ...STALL_OPT },
+// Same: a dead gate must refuse green through the normal path, not take the run down with it.
+// Keep the thrown reason for the same observability the fixer now has.
+).catch((e) => { gateDeathReason = String((e && e.message) || '').slice(0, 300); return null; });
+
+const changed = gate && Array.isArray(gate.changed_files) && gate.changed_files.length
+  ? gate.changed_files
+  : (fix && fix.changed_files) || [];
+
+// Map a free-text finding label ("[2] Stale closure …", or just the title) back to its index in
+// fixOrder. Both the fixer and the gate are told to name findings by "[index] title", so the
+// bracketed index is the primary key; title containment is the fallback. -1 = unmatched.
+const findingIndex = (label) => {
+  const s = String(label || '').toLowerCase();
+  const m = /\[(\d+)\]/.exec(s);
+  if (m) {
+    const i = Number(m[1]) - 1;
+    if (i >= 0 && i < fixOrder.length) return i;
+  }
+  // Containment fallback: never on a label too short to be specific ('' is a substring of every
+  // title), and when one title is a prefix of another prefer the LONGEST match.
+  let best = -1;
+  let bestLen = 0;
+  if (s.length >= 8) {
+    for (let i = 0; i < fixOrder.length; i++) {
+      const t = String(fixOrder[i].title || '').toLowerCase().trim();
+      if (t && t.length > bestLen && (s.includes(t) || t.includes(s))) { best = i; bestLen = t.length; }
+    }
+  }
+  return best;
+};
+const gatePer = gate && Array.isArray(gate.per_finding) ? gate.per_finding : [];
+// A fixer that DIED (null report — harness death, terminal API error) must not read as "nothing
+// to attribute": the gate may have finished the fixes itself (its prompt allows minimal fixes), so
+// the tree can carry edits with no per-finding attribution — exactly the blind commit this closes.
+// Synthesize resolutions from the gate's per_finding (its flags are independent) and refuse green.
+const fixerDied = toFix.length > 0 && !fix;
+// On a fixer death the report is gone, so `changed` (report-derived) is empty — but the tree may be
+// DIRTY (the fixer edited files before it was killed; a stall severs it mid-turn). A no-fs sandbox
+// cannot see that, so ask one cheap sonnet agent to read git. `tree_delta` then lets the refusal
+// say "N unattributed edit(s)" over the real files instead of the false "changed NO files", and the
+// caller can list them on escalation. Any failure of the read falls back to [] (no worse than before).
+let treeDelta = [];
+if (fixerDied) {
+  const scan = await agent(
+    `Report the REALIZED working-tree delta in ${WT} — uncommitted edits an interrupted fixer may have left. Run EXACTLY: git -C ${WT} status --porcelain=v1 -uall
+(-uall is load-bearing: bare porcelain hides files inside new directories as "dir/".)
+Return paths = one entry per line: strip the two status chars + space; for a rename ("R  old -> new") return the NEW path; strip any surrounding double-quotes git adds; include deleted files' paths. No commentary, no filtering.`,
+    { label: 'tree-scan', phase: 'gate', schema: REALIZED, effort: 'low', model: 'sonnet' },
+  ).catch(() => null);
+  if (scan && Array.isArray(scan.paths)) treeDelta = scan.paths.map(String).filter(Boolean);
+  if (treeDelta.length) log(`harden: fixer died leaving ${treeDelta.length} unattributed edit(s) in the tree: ${treeDelta.join(', ').slice(0, 200)}`);
+}
+const sourceResolutions = fix && Array.isArray(fix.resolutions)
+  ? fix.resolutions
+  : gatePer.map((p) => ({ finding: p && p.finding, files: '', test_added: '', note: 'synthesized from the gate report — the fixer returned no structured report', out_of_range: !!(p && p.out_of_range), behavior_change: !!(p && p.behavior_change) }));
+// Per-resolution record the caller gates on. Flags are OR-ed deliberately: a gate `false` never
+// clears a fixer `true` — either party seeing a hazard keeps it. finding_file lets the caller apply
+// the doc-finding rule (a finding in a doc file must not be "fixed" in runtime code).
+const fixResolutions = sourceResolutions.map((r) => {
+  const idx = findingIndex(r.finding);
+  const g = gatePer.find((p) => p && findingIndex(p.finding) === idx && idx >= 0);
+  return {
+    finding: String(r.finding || ''),
+    files: String(r.files || ''),
+    test_added: String(r.test_added || ''),
+    note: String(r.note || ''),
+    finding_file: idx >= 0 ? String(fixOrder[idx].file || '') : '',
+    out_of_range: !!(r.out_of_range || (g && g.out_of_range)),
+    behavior_change: !!(r.behavior_change || (g && g.behavior_change)),
+    deferred: !!r.deferred,
+  };
+});
+// A deferred finding is UNFIXED BY DESIGN, so it must not read as one the fixer skipped: it is
+// excluded from the no-resolution refusal above and surfaced to the caller as its own channel,
+// carrying the exact edit a human (or a later, correctly-scoped wave) has to make.
+// A DEFERRED finding is not-closed ON PURPOSE (strict_range), so the gate will correctly judge it
+// not-closed and this refusal would then undo the whole point of deferring — the wave would
+// escalate for obeying its own instruction. Deferrals are excluded here and reported through
+// deferred_out_of_range instead, which is the channel a human acts on.
+//
+// BUT A DEFERRAL IS A CLAIM, AND CLAIMS ARE VERIFIED HERE, NOT TRUSTED. `deferred` was the only
+// safety flag in this workflow with no mechanical re-check, and it buys the strongest exemption
+// there is: it excuses a finding from BOTH green refusals at once. A fixer that marked every
+// finding deferred earned green with zero edits — two confirmed blockers reported as
+// "confirmed-and-fixed" to the Coven's memory, and both ghosts exorcised. Three guards:
+//   (a) it only exists under strict_range — with it off the fixer is never even told about
+//       deferral, so a `deferred:true` there is noise, not an instruction being followed;
+//   (b) the finding's file must ACTUALLY be out of range — a file inside the caller's allow-set,
+//       or a test file, cannot honestly be deferred as "out of range for this wave";
+//   (c) it cannot be the whole run. A fixer deferring everything did not fix anything, and that
+//       is an escalation, not a green.
+const ALLOWED_SET = new Set(ALLOWED_FILES);
+const TEST_RE = (() => { try { return A.test_path_re ? new RegExp(A.test_path_re) : null; } catch (e) { return null; } })();
+const deferrable = (idx) => {
+  if (!STRICT_RANGE || idx < 0 || !fixOrder[idx]) return false;
+  const f = String(fixOrder[idx].file || '');
+  if (!f) return false;
+  return !ALLOWED_SET.has(f) && !(TEST_RE && TEST_RE.test(f));
+};
+const honouredDeferrals = fixResolutions
+  .map((r) => ({ r, idx: findingIndex(r.finding) }))
+  .filter(({ r, idx }) => r.deferred && deferrable(idx));
+const bogusDeferrals = fixResolutions
+  .map((r) => ({ r, idx: findingIndex(r.finding) }))
+  .filter(({ r, idx }) => r.deferred && !deferrable(idx));
+const deferredIdx = new Set(honouredDeferrals.map(({ idx }) => idx).filter((i) => i >= 0));
+const deferredOutOfRange = honouredDeferrals.map(({ r }) => ({ finding: r.finding, note: r.note }));
+if (deferredOutOfRange.length) log(`fix DEFERRED ${deferredOutOfRange.length} out-of-range edit(s): ${deferredOutOfRange.map((d) => d.finding).join(' | ').slice(0, 300)}`);
+
+// ── Green is EARNED, not asserted ─────────────────────────────────────────────────────────────
+// `gate.green` is one Fable agent's opinion about its own work. Three independent ways that
+// opinion could previously ship a range that was not green; each is now a refusal with a reason.
+const greenRefusals = [];
+
+// (0) A DEAD GATE IS UNVERIFIED, NOT RED. The gate agent is spawned through tryAgent and a throw
+// yields null, so `gate.green` was falsy and green was refused — with NOTHING in this list. The
+// caller selects its escalation wording by greenRefusals.length, so a dead gate read to the human
+// as "broken fixer edits", i.e. an accusation about a fix set nobody ever looked at. Say the true
+// thing: the range was judged neither good nor bad.
+if (!gate) greenRefusals.push(`gate agent returned no report${gateDeathReason ? ` (${gateDeathReason})` : ''} — the fix set is UNVERIFIED (judged neither good nor bad)`);
+
+// (1) OBSERVED EXITS BEAT THE VERDICT. rite-cadence applies this to its integration gate and
+// states why ("pg-smoke exited 4 on every backend wave in one consumer repo while this stage kept
+// returning green") — and then handed this gate the same engine-appended pg-smoke and
+// migration-gate commands and trusted a boolean. A missing code is a refusal too: silence about a
+// gate is not evidence it passed, the same fail-loud rule as a dead finder or a dead refuter.
+// `&& gate` because (0) already covers a dead gate: without it every configured command also
+// reports "gate[N] reported NO exit code", which implies a gate that RAN and stayed silent.
+if (GATE_CMDS.length && gate) {
+  const exits = new Map((Array.isArray(gate.gate_exits) ? gate.gate_exits : []).filter(Boolean).map((e) => [e.index, e]));
+  for (let gi = 0; gi < GATE_CMDS.length; gi++) {
+    const entry = exits.get(gi);
+    if (!entry) greenRefusals.push(`gate[${gi}] reported NO exit code`);
+    else if (entry.exit_code !== 0) {
+      // A nonzero gate is excused ONLY when every failure it NAMES is inherited. Silence is not
+      // an excuse: a nonzero gate that names nothing still refuses green, which is exactly the
+      // pre-1.7.3 behavior and the right way to degrade.
+      // Engine-appended gates (pg-smoke, migration-gate) sit at ENGINE_GATE_FROM and above in the
+      // list the caller handed us. They are schema/smoke checks that cannot fail on a test id, so
+      // a failures[] list attached to one is never an excuse — that is the precise laundering Fix
+      // C was written to stop. Absent the hint, nothing is treated as engine-appended.
+      // Inherited-red GATE (no ids at the caller's base, none now): never a green refusal. The
+      // moment it names a failing test, that is information the caller's probe never saw, and the
+      // all-ids-must-be-baseline-red rule below takes it back.
+      if (gi < ENGINE_GATE_FROM && BASELINE_RED_GATE_IDX.has(gi) && ranAndReported(entry.exit_code) && !((entry.failures || []).length)) {
+        const line = `inherited-red gate: gate[${gi}] exited ${entry.exit_code} and was already red with no test ids at the caller's base — not refusing green`;
+        log(line);
+        inheritedRedGates.push(gi);
+      }
+      else if (gi < ENGINE_GATE_FROM && baselineExcuses(entry.failures, BASELINE_RED))
+        log(`baseline-red excusal: gate[${gi}] exited ${entry.exit_code}, every failure it named is inherited (${entry.failures.join(' | ')})`);
+      else greenRefusals.push(`gate[${gi}] exited ${entry.exit_code}${(entry.failures || []).length && BASELINE_RED_GATE_IDX.has(gi) ? ` — it was inherited-red at the base, but it NAMED failing tests this time, so the excusal does not hold: ${entry.failures.join(' | ')}` : (entry.failures || []).length ? ` with failure(s) outside BASELINE-RED: ${entry.failures.join(' | ')}` : !ranAndReported(entry.exit_code) ? ' — that code means the gate never RAN (not executable, missing, killed, or not attempted), which is never excusable' : BASELINE_RED.length ? ' and named no failures[], so it cannot be excused as baseline-red' : ''}`);
+    }
+  }
+}
+
+// (1b) DEFERRAL CLAIMS, verified above. A deferral excuses a finding from refusal (2), so an
+// unverified one is the strongest lever in the workflow — it must cost green, not buy it.
+if (bogusDeferrals.length)
+  greenRefusals.push(`${bogusDeferrals.length} resolution(s) claim deferred:true for a finding that is IN range${STRICT_RANGE ? '' : ' (and strict_range is off, so nothing was ever deferred)'}: ${bogusDeferrals.map((d) => String(d.r.finding || '?').slice(0, 60)).join(' | ')}`);
+if (honouredDeferrals.length && honouredDeferrals.length >= fixOrder.length)
+  greenRefusals.push(`every confirmed finding (${fixOrder.length}) was deferred — nothing was fixed, so this is an escalation, not a green`);
+
+// (2) A FINDING THE GATE ITSELF CALLS OPEN. The gate is required to judge every finding
+// closed/partial/not-closed, and nothing read the verdict — so it could return green with every
+// finding still not-closed, and the caller would then write those findings back to the Coven's
+// memory as "confirmed-and-fixed". `partial` is surfaced, not refused: it is a judgement call the
+// human should see, not an automatic stop.
+const notClosed = gatePer
+  .filter((p) => p && p.verdict === 'not-closed' && !deferredIdx.has(findingIndex(p.finding)))
+  .map((p) => String(p.finding || '?').slice(0, 80));
+if (notClosed.length) greenRefusals.push(`gate judged NOT-CLOSED: ${notClosed.join(' | ')}`);
+
+// (3) FINDINGS WITH NO FIX AT ALL. A fixer returning {resolutions: [], changed_files: []} is not
+// "died" (fixerDied requires a null report), so an empty fixer + a trivially green suite reached
+// green. The caller checks the mirror case — edits with no findings — and never this one.
+// Two different things used to collapse into one message. A finding with no resolution is a
+// fixer that SKIPPED work. A resolution whose label we could not parse back to an index is a
+// BOOKKEEPING miss — the fix may well exist. Reporting the second as the first escalated waves
+// that were fine, which is the false-escalation class Group C exists to remove.
+const addressed = new Set(fixResolutions.map((r) => findingIndex(r.finding)).filter((i) => i >= 0));
+const unparsed = fixResolutions.filter((r) => findingIndex(r.finding) < 0);
+// Positional fallback: same count, every label unparseable — the fixer answered in order and only
+// its NAMING is off. Trust the order rather than escalating a wave whose work is probably done.
+const positional = unparsed.length === fixResolutions.length && fixResolutions.length === fixOrder.length;
+// APPLY the mapping; do not delete the refusal. Emptying `unaddressed` did not match anything
+// positionally — it simply removed green refusal (3), so a fixer returning prose-labelled
+// resolutions with no files and no edits earned green, the caller exorcised the ghosts, and the
+// never-fixed findings went to the Coven's memory under a header reading "confirmed-and-FIXED".
+// That is the all-deferred damage profile reopened through a different door, and prose labels are
+// the COMMON fixer failure, not an adversarial one.
+const positionalIdx = positional ? new Set(fixResolutions.map((_, i) => i)) : new Set();
+// A gate `closed` verdict only counts when the gate could plausibly have closed it — it edited
+// something, or the fixer died and the gate was the only party that could have. Otherwise the
+// same agent whose `green` boolean this file refuses to trust buys the exemption with a different
+// field.
+const gateEvidence = fixerDied || (gate && Array.isArray(gate.changed_files) && gate.changed_files.length > 0);
+const gateClosed = gateEvidence
+  ? new Set(gatePer.filter((p) => p && p.verdict === 'closed').map((p) => findingIndex(p.finding)).filter((i) => i >= 0))
+  : new Set();
+const unaddressed = fixOrder.map((f, i) => (addressed.has(i) || positionalIdx.has(i) || gateClosed.has(i) ? null : f)).filter(Boolean);
+// NO EDITS CANNOT CLOSE A FINDING. Reachable without the positional path too: well-labelled
+// resolutions with empty `files` and an empty `changed_files` list passed every other refusal.
+if (fixOrder.length && !changed.length)
+  greenRefusals.push(
+    fixerDied && treeDelta.length
+      // The refusal that read "changed NO files" over a DIRTY tree is the false tell that
+      // misdirected this ghost's author. Name the reality: the fixer left edits, but nothing
+      // attributes them to a finding, so they still cannot be committed. Green stays refused (AC3).
+      ? `fix stage REPORTED no files, but the tree carries ${treeDelta.length} UNATTRIBUTED edit(s) (fixer died before reporting): ${treeDelta.join(', ').slice(0, 200)} — nothing can be attributed to a finding`
+      : `${fixOrder.length} confirmed finding(s) but the fix stage changed NO files — nothing can have been closed`,
+  );
+if (positional) log(`fix: ${fixResolutions.length} resolution(s) had unparseable labels but match fixOrder 1:1 — matched positionally rather than refusing green`);
+if (unparsed.length && !positional) log(`fix warn: ${unparsed.length} resolution label(s) could not be mapped to a finding: ${unparsed.map((r) => String(r.finding || '?').slice(0, 50)).join(' | ')}`);
+if (unaddressed.length) greenRefusals.push(`${unaddressed.length}/${fixOrder.length} confirmed finding(s) have NO resolution and the gate did not judge them closed: ${unaddressed.map((f) => String(f.title || '?').slice(0, 60)).join(' | ')}`);
+
+// (4) A REFUSAL MUST EXPLAIN ITSELF. `green` below is false when the gate agent's OWN boolean is
+// false, and that path collected no refusal — so `green:false` with an EMPTY green_refusals was
+// reachable, and it is what actually happened. The caller picks its escalation message by
+// green_refusals.length, so an empty list routed three consecutive waves' verified-good fix sets
+// (every gate exit 0, 25 of 29 findings closed, all three patches later re-applied and committed
+// by hand) to "harden did not return green — broken fixer edits left UNCOMMITTED for inspection".
+// That sentence was false every time, and it is the first thing the human reads.
+// This does NOT change WHAT refuses green — `partial` stays surfaced-not-refused per (2), and the
+// deferred-out-of-range exclusion at (2) stands. It only makes a refusal say why, sourced from
+// what the gate itself reported, so the caller can name the cause instead of guessing at it.
+if (gate && gate.green === false && !greenRefusals.length) {
+  // Take the gate's STATED reason (schema field, asked for directly) — never a regex over its
+  // prose. Alongside it, report only what the engine itself observed: exit codes and a verdict
+  // tally. Those are facts. The verdict counts are deliberately NOT presented as the cause —
+  // `partial` does not refuse green here (:620-624 rules it a judgement call the human should see)
+  // and a strict_range deferral is unfixed by design, so naming either as "the reason" would be
+  // the same false attribution one layer along. They are context for the human's decision, and in
+  // the shape that would have let a reader recognise a good fix set at a glance:
+  // "every gate exited 0; 25 closed / 4 partial / 0 not-closed".
+  const said = String(gate.green_reason || '').trim();
+  const v = { closed: 0, partial: 0, 'not-closed': 0 };
+  gatePer.forEach((p) => { if (p && v[p.verdict] !== undefined) v[p.verdict]++; });
+  const facts = `facts the engine holds: ${!GATE_CMDS.length ? 'no gate commands configured' : inheritedRedGates.length ? `every gate exited 0 except ${inheritedRedGates.map((i) => `gate[${i}]`).join(', ')}, excused as inherited-red` : 'every gate exited 0'}; verdicts ${v.closed} closed / ${v.partial} partial / ${v['not-closed']} not-closed`;
+  greenRefusals.push(
+    said
+      ? `gate refused green: ${said.slice(0, 300)} (${facts})`
+      : `gate refused green WITHOUT stating a reason (${facts}) — inspect the fix set by hand`,
+  );
+}
+if (greenRefusals.length) log(`gate REFUSED green: ${greenRefusals.join(' ; ').slice(0, 400)}`);
+
+return {
+  confirmed: confirmed.map((f) => ({ title: f.title, file: f.file, line: f.line, severity: f.severity })),
+  refuted,
+  unverified,
+  verify_stats: verifyStats,
+  deferred_minor: deferred.map((f) => ({ title: f.title, file: f.file })),
+  green: !!(gate && gate.green) && !fixerDied && !greenRefusals.length,
+  green_refusals: greenRefusals,
+  // What this gate waved through because the caller had already proven it red at the base. The
+  // caller lifts these into its own wave warnings — an excusal a human cannot see is a dead gate.
+  inherited_red_gates: inheritedRedGates,
+  aborted: false,
+  fixer_died: fixerDied,
+  // The death reason (a stall names itself: "agent stalled on all 6 attempts (no progress for
+  // 180000ms each)") goes FIRST — the caller slices `reason` at 600 and its EVP at 1200, and run
+  // 2's refusal join already ran past 400 chars, so a trailing reason gets cut.
+  fixer_death_reason: fixerDeathReason || undefined,
+  gate_death_reason: gateDeathReason || undefined,
+  reason: fixerDied
+    ? `${fixerDeathReason ? fixerDeathReason + ' — ' : ''}fixer returned no structured report; any fix in the tree is UNATTRIBUTED (the gate may have made it); refusing green`
+    // NOT "reported green but the facts refuse it" — that wording assumes the gate CLAIMED green,
+    // which is false on the two paths that now dominate: a gate that refused green itself, and a
+    // gate that never returned. One neutral heading covers all of them without asserting what the
+    // gate said.
+    : (greenRefusals.length ? `green refused: ${greenRefusals.join(' ; ')}` : undefined),
+  dead_lenses: deadLenses,
+  // On a fixer death `changed` (report-derived) is empty; fall back to the porcelain read so the
+  // caller's escalation can LIST the unattributed edits instead of showing an empty set.
+  changed_files: changed.length ? changed : treeDelta,
+  tree_delta: treeDelta,
+  fix_resolutions: fixResolutions,
+  deferred_out_of_range: deferredOutOfRange,
+  gate: gate
+    ? { green: gate.green, per_finding: gate.per_finding, new_defects: gate.new_defects, out_of_scope_hunks: gate.out_of_scope_hunks, totals: gate.totals, gate_exits: gate.gate_exits || [] }
+    : null,
+};

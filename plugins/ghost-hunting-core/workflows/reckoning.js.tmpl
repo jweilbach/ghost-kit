@@ -1,0 +1,1898 @@
+export const meta = {
+  name: 'reckoning',
+  description:
+    'Holistic codebase audit engine behind /reckoning. ONE Part per run (args.part: imprints | fidelity | health | verdict); the /reckoning skill pins a detached tree, snapshots the platform, runs the instruments, composes each run\'s args and applies the approved plan. HEALTH reviews the code in scope (the whole codebase for a wide run; a named Rite / Haunting / séance reviews only the files its ghosts touched, with their one-hop neighbours as context) shard by shard against three layers — universal principles (P-*), the repo\'s personas, and its stated tenets (T-*) — and every finding must cite what it violates or the engine drops it. FIDELITY checks every in-scope ghost\'s claims against the pinned code (evidence classes; delivered / partial / missing / divergent / superseded / regressed / misses_point / unverifiable), judges open ghosts (already done / still needed / obsolete), runs persona walkthroughs and writes a worst-first headline per Rite and Haunting from ENGINE-COMPUTED numbers. IMPRINTS reconciles the in-jurisdiction Imprints the run touches (keep / edit / supersede / banish / duplicate_of / promote) under ENGINE-OWNED validity rules (keep-or-widen scope, a merge\'s scope ≥ both targets, org items carry no project_id, an edit never changes scope, enum and length caps, real link targets, one op per target) and needs a full upholding quorum for any destructive op. VERDICT clusters across Parts, dedupes against the backlog snapshot, applies the ruthless filing bars and ENGINE-OWNED caps (≤7 new ghosts, status-change and EVP caps, ≤5 new Imprints, misses_point only ever an Augury, small fixes gathered into ONE fix_batch ghost), and writes a decision-first Scroll plus appendix. VERIFY FIRST, CLUSTER SECOND: batched, lens-diverse refuters (correctness / impact / intent) judge single findings; wardens cluster only the survivors and may never drop one. FAIL-LOUD: dead or null agents land in a coverage matrix, a dead refuter is never a refutation (one neutral retry), too few live finders returns an abort sentinel, a spawn budget returns budget_exhausted, and every cap or demotion is returned in caps[]. The workflow NEVER writes to the Ghost Hunting API or to code: leaves write only through reckoning-bus.sh into the bus directory inside the pinned tree, and each Part ends by sealing its decisions (djb2-checked) for the next Part to read.',
+  phases: [
+    { title: 'imprints' },
+    { title: 'fidelity' },
+    { title: 'health' },
+    { title: 'verify' },
+    { title: 'synthesize' },
+    { title: 'verdict' },
+  ],
+};
+
+// ── Args ──────────────────────────────────────────────────────────────────────────────────────
+// The skill composes a copy of this file with `const __RECKONING_ARGS__ = {...}` inserted after the
+// meta block (reckoning-bus.sh compose). A Claude Workflow call would otherwise make the model retype
+// hundreds of ghost and Imprint ids into the tool call; jq writes them exactly instead. On Codex the
+// runner's --args-file fills `args` and the const is absent. `typeof` on an undeclared name is safe.
+let A = typeof __RECKONING_ARGS__ === 'object' && __RECKONING_ARGS__ !== null ? __RECKONING_ARGS__ : args;
+if (typeof A === 'string') {
+  try {
+    A = JSON.parse(A);
+  } catch (e) {
+    A = {};
+  }
+}
+if (!A || typeof A !== 'object') A = {};
+
+const arr = (v) => (Array.isArray(v) ? v : []);
+// Truncate by UTF-16 units but never between a surrogate pair: a lone surrogate in a sealed string
+// is rewritten by jq on the way to `record`, and the seal's checksum would never match again.
+const str = (v, max) => {
+  const s = String(v == null ? '' : v);
+  let end = max || 100000;
+  if (s.length <= end) return s;
+  const c = s.charCodeAt(end - 1);
+  if (c >= 0xd800 && c <= 0xdbff) end -= 1;
+  return s.slice(0, end);
+};
+const trimSlash = (s) => String(s || '').replace(/\/+$/, '');
+
+const PARTS = ['imprints', 'fidelity', 'health', 'verdict'];
+const PART = String(A.part || '');
+const REPO = '__CFG_repo__';
+const TREE = trimSlash(A.tree);
+const CTX = trimSlash(A.ctx) || (TREE ? TREE + '/.reckoning' : '');
+const BUS = trimSlash(A.bus);
+const BUS_SCRIPT = String(A.bus_script || '');
+const SNAP = trimSlash(A.snapshot) || (CTX ? CTX + '/snapshot' : '');
+const INSTR = trimSlash(A.instruments) || (CTX ? CTX + '/instruments' : '');
+{
+  const missing = [];
+  if (!PARTS.includes(PART)) missing.push(`part (one of ${PARTS.join('|')})`);
+  if (!TREE) missing.push('tree');
+  if (!BUS) missing.push('bus');
+  if (!BUS_SCRIPT) missing.push('bus_script');
+  if (missing.length)
+    throw new Error(`reckoning: missing/invalid args: ${missing.join(', ')} — this engine is driven by the /reckoning skill, which composes its args`);
+  // A Codex child can only write under its --repo root, and the skill starts the runner with
+  // --repo <tree>. A bus outside the tree is the "files are the bus" design silently failing.
+  if (!BUS.startsWith(TREE + '/')) throw new Error(`reckoning: bus must live INSIDE the pinned tree (${TREE}); got ${BUS}`);
+}
+
+const DEPTH = A.depth === 'survey' ? 'survey' : 'standard';
+const SCOPE = A.scope && typeof A.scope === 'object' ? A.scope : { kind: 'repo' };
+const POSTURE = A.posture === 'coven' ? 'coven' : 'seance';
+const REASON = str(A.reason, 1000).trim();
+// The largest tenant the repo designs for (.ghost/config.json reckoning.reference_scale). Without it
+// the only number a reviewer has is the test suite's fixture cardinality, at which a sort, a scan or a
+// whole-history aggregate costs nothing — one consumer repo's 0.5–1.8 s → 15–140 ms fix was invisible there.
+const REF_SCALE = str(A.reference_scale, 600).trim();
+const PRINCIPLES_PATH = String(A.principles_path || '');
+const TENETS_PATH = String(A.tenets_path || '');
+const TENET_IDS = arr(A.tenet_ids).map(String).filter((s) => /^T-[a-z0-9-]+$/.test(s));
+const PERSONAS = arr(A.personas)
+  .filter((p) => p && p.key)
+  .map((p) => ({ key: String(p.key), file: String(p.file || ''), kinds: arr(p.kinds).map(String), focus: str(p.focus, 600), reasoning: !!p.reasoning }));
+
+// Numbers that bound the run. Every one is overridable per invocation and every use that drops
+// something records it in CAPS — a silent cap reads as "covered everything" when it did not.
+const num = (v, d) => (Number.isFinite(Number(v)) && Number(v) > 0 ? Math.trunc(Number(v)) : d);
+const LIM = {
+  // A full séance reckoning is ~600 agents across all its runs; one run should rarely need more than
+  // a few hundred. The budget is a ceiling, not a target — raise it per run with --budget.
+  budget: num(A.budget, 350),
+  // Standard depth runs one finder per (shard, principle group), so each finder's list is narrow and its
+  // top 5 carry it; a survey finder covers every group on a shard and keeps 8. Pilot C (2026-09-29): every
+  // finder filled its cap, and verifying the tail is most of a run's cost.
+  per_finder: num(A.max_findings_per_finder, DEPTH === 'survey' ? 8 : 5),
+  refute_batch: num(A.refute_batch, 6),
+  claims_per_ghost: num(A.max_claims_per_ghost, 7),
+  persona_bundle: num(A.persona_bundle, 4),
+  walks_per_rite: num(A.max_walks_per_rite, 3),
+  scoped_small: num(A.scoped_small, 6),
+  themes_per_warden: num(A.max_themes_per_warden, 10),
+  new_ghosts: num(A.max_new_ghosts, 7),
+  status_changes: num(A.max_status_changes, 15),
+  evps: num(A.max_evps, 25),
+  new_imprints: num(A.max_new_imprints, 5),
+  scroll_bytes: num(A.max_scroll_bytes, 60000),
+};
+const MIN_LIVE_RATIO = Number.isFinite(Number(A.min_live_ratio)) && Number(A.min_live_ratio) > 0 && Number(A.min_live_ratio) <= 1 ? Number(A.min_live_ratio) : 0.9;
+
+// Operator passthrough for the harness stall watchdog on the long single-shot stages (wardens,
+// judge, Arbiter). No default, for harden's reason: the harness default is right on a healthy host
+// and a finite watchdog cannot save a sleeping one — the skill checks caffeinate at launch instead.
+const STALL_OPT = Number(A.stall_ms) > 0 ? { stallMs: Number(A.stall_ms) } : {};
+
+// ── Models (remappable without editing the engine, like rite-cadence) ──
+const CFG_MODEL_REMAP = __CFG_model_remap__;
+const MODEL_REMAP = Object.assign(
+  {},
+  CFG_MODEL_REMAP && typeof CFG_MODEL_REMAP === 'object' ? CFG_MODEL_REMAP : {},
+  A.model_overrides && typeof A.model_overrides === 'object' ? A.model_overrides : {},
+);
+const pin = (m) => (typeof MODEL_REMAP[m] === 'string' && MODEL_REMAP[m] ? MODEL_REMAP[m] : m);
+// Per-ROLE models. Fable only where ONE agent's judgment or synthesis IS the product — the
+// cross-cutting finders, the wardens, the cluster, the judge and the Arbiter (~25 agents in a full
+// run); Opus for the bounded reading and checking that is the other ~95% (every per-shard finder,
+// persona pass, refuter, charter, verifier and checker). No role copies bytes: a Part's seal is
+// returned and written by the skill. Any role is overridable per run (args.models {role: model}, from the skill's
+// --models role=model,…) and every tier is remappable repo-wide (.ghost/config.json models.remap).
+// reasoning_persona mirrors /panel's reasoning-fable convention: the plugin's REASONING lenses
+// (staff-engineer, product-manager, senior-ux) think on Fable; a repo's reality-check personas
+// (user-hunter, user-lead, …) walk on Opus.
+const ROLE_MODELS = {
+  finder: 'opus', persona: 'opus', reasoning_persona: 'fable', cross: 'fable', refuter: 'opus', warden: 'fable',
+  charter: 'opus', verifier: 'opus', walk: 'opus', unit_warden: 'fable',
+  juris: 'opus', checker: 'opus',
+  cluster: 'fable', dedupe: 'opus', judge: 'fable', new_imprints: 'opus', recheck: 'opus', arbiter: 'fable',
+};
+// A lens that needs special intelligence is named on its own: "finder.runtime" (one principle group's
+// finders), "persona.user-medium" (one persona's passes). The most specific key wins.
+const ROLE_OVERRIDES = A.models && typeof A.models === 'object' ? A.models : {};
+const ovr = (k) => (typeof ROLE_OVERRIDES[k] === 'string' && ROLE_OVERRIDES[k] ? ROLE_OVERRIDES[k] : '');
+const PERSONA_ROLES = ['persona', 'reasoning_persona', 'walk'];
+const M = (role, lens) => ({ model: pin(String((lens && (ovr(`${role}.${lens}`) || (PERSONA_ROLES.includes(role) && ovr(`persona.${lens}`)))) || ovr(role) || ROLE_MODELS[role] || 'opus')) });
+
+// Writing leaves need Write (the bus) and nothing that edits code. The plugin ships that persona;
+// a pilot run in a session that has not loaded it yet passes leaf_agent_type: '' (no persona).
+const LEAF_TYPE = A.leaf_agent_type === undefined ? 'ghost-hunting-core:reckoning-leaf' : String(A.leaf_agent_type || '');
+const REFUTER_TYPE = A.refuter_agent_type === undefined ? 'ghost-hunting-core:staff-engineer' : String(A.refuter_agent_type || '');
+const asLeaf = LEAF_TYPE ? { agentType: LEAF_TYPE } : {};
+const asRefuter = REFUTER_TYPE ? { agentType: REFUTER_TYPE } : {};
+
+// ── Principles registry — MUST match references/principles.md ids exactly ──
+const GROUPS = [
+  { key: 'correctness_safety', ids: ['P-correct', 'P-secure', 'P-integrity'], kinds: ['backend', 'frontend', 'agent-surface', 'plugin', 'migrations', 'infra'] },
+  { key: 'runtime', ids: ['P-reliable', 'P-concurrency', 'P-efficient', 'P-scale'], kinds: ['backend', 'frontend', 'agent-surface', 'infra'] },
+  { key: 'design', ids: ['P-simple', 'P-cohesion', 'P-dry', 'P-consistent', 'P-contract'], kinds: ['backend', 'frontend', 'agent-surface', 'plugin', 'migrations', 'tests', 'infra'] },
+  { key: 'quality', ids: ['P-tested', 'P-observable', 'P-maintainable', 'P-truthful-docs', 'P-deps'], kinds: ['backend', 'frontend', 'agent-surface', 'plugin', 'migrations', 'tests', 'infra'] },
+  { key: 'experience', ids: ['P-ux', 'P-agent-ux'], kinds: ['frontend', 'agent-surface', 'plugin'] },
+];
+const PRINCIPLE_IDS = GROUPS.flatMap((g) => g.ids);
+// Experience routes by kind: a frontend shard is judged on P-ux, an agent-facing one on P-agent-ux.
+const idsFor = (g, kind) => (g.key !== 'experience' ? g.ids : kind === 'frontend' ? ['P-ux'] : ['P-agent-ux']);
+const PERSONA_KEYS = PERSONAS.map((p) => p.key);
+const KNOWN_IDS = new Set([...PRINCIPLE_IDS, ...TENET_IDS, ...PERSONA_KEYS]);
+// A finding is filed with the warden of its FIRST principle id; tenet- or persona-only findings go
+// to the goals warden. One home per finding keeps the "never drop a verified finding" check exact.
+const bucketOf = (violates) => {
+  for (const id of violates) {
+    const g = GROUPS.find((x) => x.ids.includes(id));
+    if (g) return g.key;
+  }
+  return 'goals';
+};
+
+// ── Accounting: budget, coverage, caps ─────────────────────────────────────────────────────────
+// Every spawn goes through tryAgent, so these numbers are complete. A dead agent (throw, null, or a
+// result that fails the stage's own check) degrades to null and is RECORDED — never a silent gap.
+const STATS = { spawned: 0, died: [], budget_refused: 0 };
+const COVERAGE = {}; // leaf key -> 'ok' | 'dead: why' | 'budget'
+const CAPS = [];
+const cap = (kind, detail) => {
+  CAPS.push({ kind, detail: str(detail, 400) });
+  log(`cap: ${kind} — ${str(detail, 200)}`);
+};
+let BUDGET_HIT = false;
+const tryAgent = (key, prompt, opts, ok) => {
+  if (STATS.spawned >= LIM.budget) {
+    BUDGET_HIT = true;
+    STATS.budget_refused += 1;
+    COVERAGE[key] = 'budget';
+    return Promise.resolve(null);
+  }
+  STATS.spawned += 1;
+  return agent(prompt, opts)
+    .then((r) => {
+      if (r == null || typeof r !== 'object' || (ok && !ok(r))) {
+        const why = r == null ? 'returned nothing' : 'result failed the stage check';
+        STATS.died.push({ label: opts.label, reason: why });
+        COVERAGE[key] = `dead: ${why}`;
+        return null;
+      }
+      COVERAGE[key] = 'ok';
+      return r;
+    })
+    .catch((e) => {
+      const why = str((e && e.message) || e, 200);
+      STATS.died.push({ label: opts.label, reason: why });
+      COVERAGE[key] = `dead: ${why}`;
+      log(`agent died (${opts.label}): ${why.slice(0, 160)}`);
+      return null;
+    });
+};
+
+// pipeline() is not available on every host (the Codex runner exposes only parallel), so this is
+// the same no-barrier shape built on parallel: each item runs its own stage chain, a null result
+// ends that item's chain, and a throw anywhere resolves to null instead of rejecting the batch —
+// Codex's parallel is a bare Promise.all, where one rejection would kill the whole run.
+const pipe = (items, ...stages) =>
+  parallel(
+    items.map((item, i) => () =>
+      stages
+        .reduce((p, stage, si) => p.then((prev) => (si > 0 && prev == null ? null : stage(prev, item, i))), Promise.resolve(item))
+        .catch((e) => {
+          log(`pipe item ${i} failed: ${str((e && e.message) || e, 160)}`);
+          return null;
+        }),
+    ),
+  );
+const all = (thunks) => parallel(thunks.map((t) => () => Promise.resolve().then(t).catch(() => null)));
+const chunk = (xs, n) => {
+  const out = [];
+  for (let i = 0; i < xs.length; i += n) out.push(xs.slice(i, i + n));
+  return out;
+};
+const pad = (n, w) => String(n).padStart(w || 3, '0');
+const SEV = { blocker: 3, major: 2, minor: 1 };
+const sevRank = (s) => SEV[s] || 0;
+
+// Paths: leaves are told to cite relative paths, but an absolute one under the tree is normalized,
+// and one OUTSIDE the tree (the session's own, possibly newer or dirty, checkout) is rejected —
+// that is a citation of code the reckoning did not pin. Same prefix-strip idiom as rite-cadence.
+const TREE_PREFIX = TREE + '/';
+const relPath = (p) => {
+  let s = String(p == null ? '' : p).trim().replace(/^"|"$/g, '');
+  if (s.startsWith(TREE_PREFIX)) s = s.slice(TREE_PREFIX.length);
+  while (s.startsWith('./')) s = s.slice(2);
+  return s;
+};
+const insideTree = (rel) => !!rel && !rel.startsWith('/') && !rel.startsWith('../') && rel !== '..';
+
+// djb2, as rite-cadence's writeback key uses — no crypto in this sandbox. Here it is the integrity
+// check on a Part's returned seal: `record` recomputes it before writing the seal file.
+const djb2 = (s) => {
+  let h = 5381;
+  for (let i = 0; i < s.length; i++) h = ((h * 33) ^ s.charCodeAt(i)) >>> 0;
+  return h.toString(16).padStart(8, '0');
+};
+
+// ── Shared prompt blocks ─────────────────────────────────────────────────────────────────────
+const TREE_RULES = `PINNED TREE — the code under review, frozen at one commit: ${TREE}
+- Read code ONLY under ${TREE}, with absolute paths (Read ${TREE}/<path>; Grep/Glob with path ${TREE}). Your shell may start in a DIFFERENT checkout of the same repo that is newer or has uncommitted edits: never read it, never cite it.
+- Cite every location RELATIVE to the pinned tree, e.g. backend/app/api/tasks.py:120 — never an absolute path.
+- READ-ONLY: never edit, create, move or delete anything except your own artifact through the one bus command given below. Never run the app, a migration, an install or a formatter.
+- NO NETWORK: never call the Ghost Hunting API or any other service. What you need about ghosts, Imprints and Auguries is in the snapshot files under ${SNAP}.`;
+
+const GOALS = `WHAT A FINDING IS JUDGED AGAINST — every finding MUST cite at least one id it violates (anything else is dropped):
+- Layer A, universal engineering principles: ${PRINCIPLES_PATH || '(principles file missing)'} — ids ${PRINCIPLE_IDS.join(', ')}. Read the violation patterns AND the "Not a violation" lists.
+- Layer B, this repo's personas: ${PERSONA_KEYS.length ? PERSONA_KEYS.join(', ') : '(none configured)'}.
+- Layer C, this repo's stated goals: ${TENETS_PATH && TENET_IDS.length ? `${TENETS_PATH} — ids ${TENET_IDS.join(', ')}` : '(no tenets file — Layers A and B only)'}${REASON ? `\n- This reckoning's own stated reason, also a goal: "${REASON}"` : ''}
+- Reference scale: ${REF_SCALE ? `the largest tenant this repo designs for is "${REF_SCALE}". Judge growth and what each statement costs (P-efficient, P-scale) at THAT size.` : 'none stated, so P-scale\'s "beyond the stated scale" exemption cannot be claimed for a table that grows with activity (a row per event, order, message or log).'} The test suite's row counts are fixture-sized: no number measured on them shows a statement is cheap at scale.
+SETTLED DECISIONS ARE NOT FINDINGS. Before reporting, check ${SNAP}/auguries.json (answered Auguries), the tenets' "Deliberate exceptions", and ${SNAP}/imprints.json. A deliberate, documented choice is not a violation.`;
+
+const commitInstr = (key, what) => `WRITE YOUR ARTIFACT (this is how your work survives this run): write ${what} as ONE JSON object — exactly the object you will return, minus stub_sha — to ${BUS}/.tmp/${key}.json (Write tool). Optional longer notes go to ${BUS}/.tmp/${key}.md. Then run EXACTLY:
+  bash "${BUS_SCRIPT}" commit "${BUS}" ${key} "${BUS}/.tmp/${key}.json" ["${BUS}/.tmp/${key}.md"]
+It validates and writes atomically and prints {"key","stub_sha","detail_sha","items"}. Put its stub_sha in your return. If it exits nonzero, read the message, fix the JSON and run it again. Never write anywhere else.`;
+
+// Every writing leaf returns its stub plus the bus receipt's sha; a result without one did not
+// persist anything the next Part can read, so it counts as dead for coverage.
+const hasSha = (r) => typeof r.stub_sha === 'string' && /^[0-9a-f]{64}$/.test(r.stub_sha);
+
+// ── Seal: the Part's decisions, RETURNED with their checksum ────────────────────────────────
+// The workflow has no filesystem, so a Part returns its sealed decisions as seal_content together
+// with the djb2 the engine computed, and the skill's `reckoning-prep.mjs record` writes
+// <bus>/<name>.seal.json after re-checking that checksum (the next Part cannot start until record
+// has run). No agent copies the bytes: in pilots B and C the LLM scribes that used to cost 18 of 134
+// agents, and refused the copy three times when a relayed chat message read like an injected command.
+const seal = (name, obj) => {
+  const body = JSON.stringify(obj);
+  return { name, djb2: djb2(body), chars: body.length, path: `${BUS}/${name}.seal.json`, content: obj };
+};
+
+// ── Generic batched-refuter machinery (used by every Part) ──────────────────────────────────
+// A task is { id, lens, slot, text } — slot numbers the independent votes a lens casts on one item.
+// Tasks are grouped by (lens, slot) and chunked, so K items share one refuter call but two votes on
+// the same item are always two DIFFERENT agents. A dead batch gets ONE retry on a restructured,
+// neutral prompt with no persona (harden's lesson: an identical retry recovered 0 of 5 lost votes
+// when the deaths were deterministic refusals). A vote still missing after that is LOST — never
+// read as a refutation; each Part's tally decides what a lost vote means for its item.
+const VOTES = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    verdicts: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          id: { type: 'string' },
+          holds: { type: 'boolean' },
+          // `evidence`, never `reasoning` — see harden: the only schema field ever correlated with
+          // the refuter safeguard deaths was named `reasoning`.
+          evidence: { type: 'string' },
+          severity: { type: 'string', enum: ['blocker', 'major', 'minor', 'not-a-bug'] },
+          citation: { type: 'string' },
+        },
+        required: ['id', 'holds', 'evidence'],
+      },
+    },
+  },
+  required: ['verdicts'],
+};
+const VSTATS = { items: 0, calls: 0, died_first: 0, died_retry: 0, recovered: 0, lost_votes: 0, lost_items: [] };
+const refute = async (tasks, lensPrompt, phaseName) => {
+  const groups = new Map();
+  for (const t of tasks) {
+    const g = `${t.lens}#${t.slot}`;
+    if (!groups.has(g)) groups.set(g, []);
+    groups.get(g).push(t);
+  }
+  const batches = [];
+  const batchFor = (lens) => (lens === 'skeptic' ? 2 : LIM.refute_batch);
+  for (const [g, ts] of groups) chunk(ts, batchFor(ts[0].lens)).forEach((b, bi) => batches.push({ g, bi, lens: ts[0].lens, slot: ts[0].slot, items: b }));
+  VSTATS.items += new Set(tasks.map((t) => t.id)).size;
+  VSTATS.calls += batches.length;
+  const votes = new Map(); // id -> [{lens, slot, v}]
+  const okFor = (b) => (r) => Array.isArray(r.verdicts);
+  const results = await all(
+    batches.map((b) => async () => {
+      const key = `refute:${phaseName}:${b.lens}.${b.slot}.${pad(b.bi)}`;
+      const opts = { label: key, phase: 'verify', schema: VOTES, effort: 'high', ...M('refuter', b.lens) };
+      let r = await tryAgent(key, lensPrompt(b.lens, b.items, false), { ...opts, ...asRefuter }, okFor(b));
+      if (!r) {
+        VSTATS.died_first += 1;
+        r = await tryAgent(key, lensPrompt(b.lens, b.items, true), { ...opts, label: `${key}.retry` }, okFor(b));
+        if (r) VSTATS.recovered += 1;
+        else VSTATS.died_retry += 1;
+      }
+      return { b, r };
+    }),
+  );
+  for (const x of results.filter(Boolean)) {
+    const byId = new Map(arr(x.r && x.r.verdicts).map((v) => [String(v.id), v]));
+    for (const t of x.b.items) {
+      const v = byId.get(t.id) || null;
+      if (!v) VSTATS.lost_votes += 1;
+      if (!votes.has(t.id)) votes.set(t.id, []);
+      votes.get(t.id).push({ lens: t.lens, slot: t.slot, v });
+    }
+  }
+  const lost = [...votes.entries()].filter(([, vs]) => vs.some((x) => !x.v)).map(([id]) => id);
+  VSTATS.lost_items.push(...lost.slice(0, Math.max(0, 20 - VSTATS.lost_items.length)));
+  if (VSTATS.died_first || VSTATS.lost_votes)
+    log(`verify(${phaseName}): ${batches.length} refuter call(s), ${VSTATS.died_first} died first, ${VSTATS.recovered} recovered, ${VSTATS.lost_votes} vote(s) LOST so far`);
+  return votes;
+};
+const voteOf = (vs, lens, slot) => {
+  const x = arr(vs).find((y) => y.lens === lens && (slot == null || y.slot === slot));
+  return x ? x.v : null;
+};
+
+// ── Result envelope (identical on every Part and every path) ─────────────────────────────────
+const coverageSummary = () => {
+  const keys = Object.keys(COVERAGE);
+  const dead = keys.filter((k) => COVERAGE[k].startsWith('dead')).map((k) => ({ key: k, why: COVERAGE[k].slice(6, 160) }));
+  const budget = keys.filter((k) => COVERAGE[k] === 'budget');
+  return { total: keys.length, ok: keys.filter((k) => COVERAGE[k] === 'ok').length, dead: dead.slice(0, 60), dead_count: dead.length, budget_skipped: budget.slice(0, 60), budget_count: budget.length };
+};
+const finish = (status, extra) => ({
+  part: PART,
+  aborted: status === 'aborted',
+  status: BUDGET_HIT && status === 'complete' ? 'budget_exhausted' : status,
+  bus: BUS,
+  depth: DEPTH,
+  ...extra,
+  coverage: coverageSummary(),
+  verify_stats: VSTATS.calls ? { ...VSTATS, lost_items: VSTATS.lost_items.slice(0, 20) } : null,
+  caps: CAPS.slice(),
+  agents: { spawned: STATS.spawned, died: STATS.died.length, budget: LIM.budget, budget_refused: STATS.budget_refused },
+  note:
+    BUDGET_HIT
+      ? `The spawn budget (${LIM.budget}) ran out: ${STATS.budget_refused} agent call(s) were refused and are listed in coverage.budget_skipped. Re-run this Part with a larger budget or a smaller scope — do not read the gaps as clean.`
+      : undefined,
+});
+
+// ════════════════════════════════════════════════════════════════════════════════════════════
+// PART: health — the whole codebase, shard × principle group, plus persona and cross-cutting passes
+// ════════════════════════════════════════════════════════════════════════════════════════════
+const FINDINGS = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    applicable: { type: 'boolean' },
+    findings: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          title: { type: 'string' },
+          file: { type: 'string' },
+          line: { type: 'integer' },
+          severity: { type: 'string', enum: ['blocker', 'major', 'minor'] },
+          violates: { type: 'array', items: { type: 'string' } },
+          evidence: { type: 'string' },
+          measured: { type: 'string' },
+          fix_sketch: { type: 'string' },
+          effort: { type: 'string', enum: ['small', 'medium', 'large'] },
+        },
+        required: ['title', 'file', 'severity', 'violates', 'evidence', 'fix_sketch', 'effort'],
+      },
+    },
+    stub_sha: { type: 'string' },
+  },
+  required: ['applicable', 'findings', 'stub_sha'],
+};
+const THEMES = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    themes: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          key: { type: 'string' },
+          title: { type: 'string' },
+          violates: { type: 'array', items: { type: 'string' } },
+          severity: { type: 'string', enum: ['blocker', 'major', 'minor'] },
+          summary: { type: 'string' },
+          members: { type: 'array', items: { type: 'string' } },
+          effort: { type: 'string', enum: ['small', 'medium', 'large'] },
+        },
+        required: ['key', 'title', 'violates', 'severity', 'summary', 'members', 'effort'],
+      },
+    },
+    scorecard: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        properties: { id: { type: 'string' }, rating: { type: 'string', enum: ['holds', 'strained', 'violated', 'not-rated'] }, note: { type: 'string' } },
+        required: ['id', 'rating', 'note'],
+      },
+    },
+    stub_sha: { type: 'string' },
+  },
+  required: ['themes', 'scorecard', 'stub_sha'],
+};
+
+// A NAMED scope (a Rite, Haunting or séance) gets ONE cross-cutting pass instead of five: does the
+// work it touched fit the codebase it landed in? It may search the whole repo — only to judge the
+// touched code (did it duplicate a helper that exists, bypass a convention, add a layer nobody needed).
+const FIT_JOB = { key: 'fit', ids: ['P-dry', 'P-consistent', 'P-cohesion', 'P-simple', 'P-contract'], focus: 'FIT AND REUSE for the TOUCHED code only: does it duplicate a helper, component or query that already exists elsewhere in the repo (search for it), bypass an established convention or layer, introduce machinery the rest of the codebase does without, or leave an agent-facing surface inconsistent with its siblings? Report findings in the TOUCHED files (or the existing code they duplicate).' };
+const CROSS_JOBS = [
+  { key: 'cohesion', ids: ['P-cohesion', 'P-simple'], focus: 'System-level layering and dependency direction ACROSS domains: which layer talks to which, leaks between layers, god modules that everything imports, machinery that spans shards without a need.' },
+  { key: 'dry', ids: ['P-dry', 'P-consistent'], focus: 'Duplication ACROSS shards: parallel implementations of one concept (e.g. a human route and an agent route re-implementing the same logic, two hooks fetching the same thing, repeated serializers), and a shared helper that exists but is bypassed.' },
+  { key: 'scale', ids: ['P-scale', 'P-efficient', 'P-concurrency', 'P-reliable'], focus: 'State and scaling across the system: in-process state (event buses, caches, rate limiters, locks) versus the deploy topology, unbounded growth, background loops, backpressure, what breaks with a second replica or a restart. And per-statement cost at the reference scale: for each table that grows with activity, does an index serve its hot reads\' tenant filter AND sort (the tenant key leading), does a count or total carry ordering or joins it does not need, is a tenant\'s whole history aggregated on every load? Read the models and migrations for the indexes — no instrument measures this.' },
+  { key: 'consistency', ids: ['P-consistent', 'P-contract'], focus: 'One way to do a thing: error shapes, pagination, naming, date/money handling, data fetching and state patterns — where the codebase does the same thing three different ways.' },
+  { key: 'agent-surface', ids: ['P-agent-ux', 'P-truthful-docs', 'P-contract'], focus: 'The whole agent-facing surface as one product: manifest/tool text size and repetition, progressive disclosure, whether docs and manifests tell the truth about the code, whether every capability is reachable by an agent.' },
+];
+
+async function runHealth() {
+  const shards = arr(A.shards)
+    .filter((s) => s && s.name && s.kind)
+    .map((s) => ({ name: String(s.name), kind: String(s.kind), paths: arr(s.paths).map(String) }));
+  const allShards = arr(A.all_shards).length ? arr(A.all_shards) : shards;
+  const GROUP = str(A.group || 'all', 60);
+  if (!shards.length && !A.cross_cutting) throw new Error('reckoning health: no shards in args.shards and cross_cutting is off — nothing to review');
+  phase('health');
+
+  // SCOPED (a named Rite / Haunting / séance): every shard carries only the files that scope's ghosts
+  // TOUCHED plus ADJACENT context (their imports, importers, tests). A wide run carries whole shards.
+  const SCOPED = A.scoped === true;
+  for (const s0 of shards) {
+    const src = arr(A.shards).find((x) => x && String(x.name) === s0.name) || {};
+    s0.touched = arr(src.touched).map(String);
+    s0.adjacent = arr(src.adjacent).map(String);
+  }
+  // Jobs: standard = one finder per (shard, applicable principle group); survey = one per shard
+  // covering every applicable group. Personas get one pass per bundle of shards of their kinds
+  // (standard: ≤ persona_bundle shards per pass; survey: the whole group in one pass).
+  const jobs = [];
+  for (const s of shards) {
+    const gs = GROUPS.filter((g) => g.kinds.includes(s.kind));
+    // A scoped shard with only a handful of touched files gets ONE finder over every applicable group:
+    // five finders over three files is the fan-out waste the user asked to cut.
+    if (DEPTH === 'survey' || (SCOPED && s.touched.length && s.touched.length <= LIM.scoped_small)) {
+      jobs.push({ key: `find.${s.name}.all`, shard: s, group: 'all', ids: [...new Set(gs.flatMap((g) => idsFor(g, s.kind)))] });
+    } else {
+      for (const g of gs) jobs.push({ key: `find.${s.name}.${g.key}`, shard: s, group: g.key, ids: idsFor(g, s.kind) });
+    }
+  }
+  const bundlePaths = (mine) => mine.flatMap((s) => [`# ${s.name} [${s.kind}] — ${s.paths.length} file(s)`, ...s.paths.slice(0, 40), ...(s.paths.length > 40 ? [`… and ${s.paths.length - 40} more under the same directories`] : [])]);
+  for (const p of PERSONAS) {
+    const mine = shards.filter((s) => p.kinds.includes(s.kind));
+    if (!mine.length) continue;
+    const size = DEPTH === 'survey' ? mine.length : LIM.persona_bundle;
+    chunk(mine, size).forEach((b, bi, all) => {
+      const key = all.length === 1 ? `persona.${GROUP}.${p.key}` : `persona.${GROUP}.${p.key}.${bi + 1}`;
+      jobs.push({ key, shard: { name: b.length === 1 ? b[0].name : `${GROUP}: ${b.map((s) => s.name).join(', ')}`, kind: [...new Set(b.map((s) => s.kind))].join('+'), paths: bundlePaths(b), touched: b.flatMap((s) => s.touched), adjacent: b.flatMap((s) => s.adjacent) }, persona: p, ids: [] });
+    });
+  }
+  if (A.cross_cutting) {
+    const scope = { name: SCOPED ? 'the scope\'s footprint' : 'whole-repo', kind: 'cross', paths: allShards.map((s) => `${s.name} [${s.kind}]: ${arr(s.paths).join(', ')}`) };
+    for (const c of SCOPED ? [FIT_JOB] : CROSS_JOBS) jobs.push({ key: `cross.${c.key}`, shard: scope, group: 'cross', ids: c.ids, cross: c });
+  }
+  // --lenses: keep only the named principle groups / personas ('cross' keeps the cross-cutting pass).
+  const ONLY = new Set(arr(A.only_lenses).map(String));
+  if (ONLY.size) {
+    const before = jobs.length;
+    for (let i = jobs.length - 1; i >= 0; i--) {
+      const j = jobs[i];
+      if (!j.persona && !j.cross && j.group === 'all') {
+        // A one-finder shard covers every group: narrow its ids to the named groups (or drop it).
+        const ids = GROUPS.filter((g) => ONLY.has(g.key)).flatMap((g) => idsFor(g, j.shard.kind)).filter((id) => j.ids.includes(id));
+        if (ids.length) j.ids = ids; else jobs.splice(i, 1);
+        continue;
+      }
+      const keep = j.persona ? ONLY.has(j.persona.key) : j.cross ? ONLY.has('cross') : ONLY.has(j.group);
+      if (!keep) jobs.splice(i, 1);
+    }
+    cap('lenses-filtered', `--lenses ${[...ONLY].join(',')} kept ${jobs.length} of ${before} finder job(s) — this group is NOT a full review`);
+  }
+  jobs.forEach((j, i) => { j.leaf = `F${pad(i + 1)}`; });
+  log(`health[${GROUP}]: ${shards.length} shard(s), ${jobs.length} finder job(s) at ${DEPTH} depth`);
+
+  const finderPrompt = (j, retry) => `${TREE_RULES}
+
+${GOALS}
+
+${j.cross ? (SCOPED ? `YOUR SCOPE: the code this reckoning's scope TOUCHED (below), judged against the WHOLE repository it landed in.\nTOUCHED + ADJACENT, BY SHARD:\n${j.shard.paths.join('\n')}\nYOUR LENS: ${j.ids.join(', ')}. ${j.cross.focus}` : `YOUR SCOPE: the WHOLE repository — every shard below — looking only for what no single-shard reviewer can see.\nSHARDS:\n${j.shard.paths.join('\n')}\nYOUR LENS: ${j.ids.join(', ')}. ${j.cross.focus}`) : SCOPED && arr(j.shard.touched).length ? `YOUR SHARD: "${j.shard.name}" (kind: ${j.shard.kind}) — this reckoning is SCOPED to one piece of work.\nTOUCHED files (the SUBJECT — what the scope's ghosts changed; review these): ${j.shard.touched.join(', ')}\nADJACENT files (CONTEXT — what the touched code imports, what imports it, its tests; read them, but report a finding in one ONLY where the touched code breaks, leaks into, or duplicates it): ${arr(j.shard.adjacent).join(', ') || '(none)'}\nDo NOT audit code outside these files; this is not a whole-codebase review.` : `YOUR SHARD: "${j.shard.name}" (kind: ${j.shard.kind}). Its paths (under the pinned tree): ${j.shard.paths.join(', ')}.`}
+${j.persona ? `YOUR LENS: the persona "${j.persona.key}". Read its definition at ${j.persona.file || '(missing — infer from the key)'} and review in ITS voice, from ITS needs${j.persona.focus ? ` (focus: ${j.persona.focus})` : ''}. Cite "${j.persona.key}" in violates, plus any P-/T- ids that apply. If nothing in this shard is this persona's surface, return applicable=false and no findings — a valid, cheap answer.` : j.cross ? '' : `YOUR LENS: ${j.group === 'all' ? 'every applicable principle' : `principle group "${j.group}"`} — ${j.ids.join(', ')}. Also check every Layer-C tenet.`}
+INSTRUMENTS (deterministic measurements — cite one when it supports a finding, e.g. [sql-per-request: GET /api/x = 14 stmts/call, 9× identical]): ${INSTR}/*.json (churn hotspots in ${INSTR}/churn.json).
+Review ${j.cross ? (SCOPED ? 'the touched code through your lens' : 'the WHOLE repository through your lens') : SCOPED ? 'every TOUCHED file' : 'the WHOLE shard'}, not a sample. Report at most ${LIM.per_finder} findings, most severe first; if you have more, keep the strongest and list the rest in one line each under "Overflow" in your .md notes (they are counted, not lost).
+Each finding: title; file + line (relative to the pinned tree); severity (blocker = wrong/corrupting behaviour or a security hole someone hits in normal use or without special knowledge; major = a real defect, or a structural cost that compounds — including a hole that needs something the caller does not normally have: an unguessable id from another Coven, a role, a leaked secret; minor = a latent hazard, a defect no real client observes, or local cleanup); violates = the ids; evidence = what the code actually does, concretely, at that location; measured = the instrument number, if any; fix_sketch; effort (small = a few lines in one place; medium; large).
+${retry ? 'This is a SECOND attempt at a job whose first attempt produced no result. Be economical: finish and commit.\n' : ''}${commitInstr(j.key, 'your result {applicable, findings}')}`;
+
+  const found = await all(
+    jobs.map((j) => async () => {
+      const opts = { label: j.key, phase: 'health', schema: FINDINGS, effort: 'high', ...M(j.cross ? 'cross' : j.persona ? (j.persona.reasoning ? 'reasoning_persona' : 'persona') : 'finder', j.cross ? j.cross.key : j.persona ? j.persona.key : j.group), ...asLeaf };
+      let r = await tryAgent(j.key, finderPrompt(j, false), opts, hasSha);
+      if (!r) r = await tryAgent(j.key, finderPrompt(j, true), { ...opts, label: `${j.key}.retry` }, hasSha);
+      return { j, r };
+    }),
+  );
+  const live = found.filter((x) => x && x.r);
+  const minLive = Math.ceil(jobs.length * MIN_LIVE_RATIO);
+  if (live.length < minLive) {
+    const reason = `only ${live.length}/${jobs.length} finder job(s) returned (need ${minLive} at min_live_ratio ${MIN_LIVE_RATIO})`;
+    log(`health ABORT — ${reason}`);
+    return finish('aborted', { reason, group: GROUP, note_abort: 'This shard group is UNREVIEWED. An empty finding list here means the finders never reported, NOT that the code is clean.' });
+  }
+
+  // Validate, cap and index every finding. Ids are F###.i — the leaf plus the index in the stub the
+  // leaf committed, so a seal status string lines up with the file the next Part reads.
+  const findings = [];
+  const status = {}; // leaf -> array of status chars, aligned with the leaf's findings array
+  for (const { j, r } of live) {
+    const fs = arr(r.findings);
+    status[j.leaf] = fs.map(() => 'z');
+    const order = fs.map((f, i) => ({ f, i })).sort((a, b) => sevRank(b.f.severity) - sevRank(a.f.severity) || a.i - b.i);
+    if (fs.length > LIM.per_finder) cap('finder-overflow', `${j.key} returned ${fs.length} findings; the ${fs.length - LIM.per_finder} weakest were set aside (status o)`);
+    order.forEach(({ f, i }, rank) => {
+      if (rank >= LIM.per_finder) { status[j.leaf][i] = 'o'; return; }
+      const file = relPath(f.file);
+      const violates = arr(f.violates).map(String).filter((id) => KNOWN_IDS.has(id));
+      if (!insideTree(file)) { cap('outside-tree', `${j.key}[${i}] cites ${str(f.file, 120)} — not under the pinned tree`); return; }
+      if (SCOPED && !j.cross && j.shard.touched && !j.shard.touched.concat(arr(j.shard.adjacent)).includes(file)) { cap('outside-footprint', `${j.key}[${i}] cites ${file} — outside this scope's touched and adjacent files`); return; }
+      if (!violates.length) { cap('no-citation', `${j.key}[${i}] "${str(f.title, 80)}" cites no known principle, persona or tenet id (${str(arr(f.violates).join(','), 80)})`); return; }
+      findings.push({ id: `${j.leaf}.${i}`, leaf: j.leaf, idx: i, job: j.key, title: str(f.title, 200), file, line: Number.isInteger(f.line) ? f.line : null, severity: SEV[f.severity] ? f.severity : 'minor', violates, evidence: str(f.evidence, 2000), measured: str(f.measured, 300), fix_sketch: str(f.fix_sketch, 1000), effort: ['small', 'medium', 'large'].includes(f.effort) ? f.effort : 'medium' });
+    });
+  }
+  // Exact dedupe only (file|line|title) — mechanical and never wrong; root-cause grouping is the
+  // wardens' job AFTER verification (harden's lesson: grouping first lets one refutation kill all).
+  const seen = new Map();
+  const unique = [];
+  for (const f of findings) {
+    const k = `${f.file}|${f.line || ''}|${f.title.trim().toLowerCase()}`;
+    if (seen.has(k)) { status[f.leaf][f.idx] = 'u'; continue; }
+    seen.set(k, f.id);
+    unique.push(f);
+  }
+  log(`health[${GROUP}]: ${findings.length} valid finding(s), ${unique.length} after exact dedupe`);
+
+  // ── verify: lens-diverse, batched ──
+  phase('verify');
+  const LENS_TEXT = {
+    correctness: 'CORRECTNESS — is the code actually like this? Read the cited location, its callers, guards and tests at the pinned tree. holds=true only if you confirm the described behaviour or structure; holds=false if the claim is wrong, stale, or handled elsewhere (put the guard, test or line that shows it in evidence).',
+    impact: "IMPACT — does it matter at this repo's ACTUAL usage and scale (its reference scale, when one is stated above)? Use the instruments (numbers), deploy config and how often the path runs. sql-per-request counts round trips at FIXTURE cardinality, never what one statement costs: a low count cannot refute a plan-cost finding (a sort or filter no index serves, a count carrying an ORDER BY, an aggregate over a tenant's whole history) — judge that from the query, its indexes and the reference scale. Set severity to what it really is (blocker / major / minor), or 'not-a-bug' if it is negligible in practice, and COUNT THE PRECONDITIONS: a hole that needs something the caller does not normally have — an unguessable id (a random UUID) from another Coven, an admin role, a leaked secret or Talisman — is at most major, however bad the payoff; a defect no real client observes (a field no screen reads, a header or body no consumer uses — grep the frontend, the MCP server and the skills) is at most minor. Blocker means hit in normal use, or by anyone without special knowledge. Name the precondition or the consumer check in evidence. holds=false only for not-a-bug.",
+    intent: 'INTENT — is this a DELIBERATE, DOCUMENTED choice? Check the answered Auguries in auguries.json, the tenets\' "Deliberate exceptions", imprints.json, CLAUDE.md and comments at the site. holds=false ONLY when a documented decision covers exactly this — put the reference (Augury title, tenet id, Imprint id, or doc path:line) in citation. No documentation means holds=true.',
+  };
+  const lensPrompt = (lens, items, retry) => `${retry ? 'You are an independent second reader checking review findings about a codebase.' : 'You are an ADVERSARIAL VERIFIER. Reviewers over-report: try to REFUTE each finding below by reading the actual code.'}
+${TREE_RULES.split('\n').slice(0, 4).join('\n')}
+${GOALS}
+YOUR QUESTION FOR EVERY FINDING — ${LENS_TEXT[lens]}
+Return one verdict per finding id.
+FINDINGS:
+${items.map((t) => t.text(retry)).join('\n\n')}`;
+  const tasks = [];
+  for (const f of unique) {
+    const text = (retry) => `[${f.id}] ${f.title}\n  at ${f.file}${f.line ? ':' + f.line : ''} · ${f.severity} · violates ${f.violates.join(', ')}\n  evidence: ${f.evidence}${f.measured ? `\n  measured: ${f.measured}` : ''}${retry ? '' : `\n  proposed fix: ${f.fix_sketch}`}`;
+    const lenses = f.severity === 'minor' ? ['correctness'] : ['correctness', 'impact', 'intent'];
+    for (const lens of lenses) tasks.push({ id: f.id, lens, slot: 0, text });
+  }
+  const votes = await refute(tasks, lensPrompt, `health.${GROUP}`);
+
+  // Tally, per lens, not by headcount. Correctness is load-bearing: its refutation kills the finding,
+  // and its loss keeps the finding UNVERIFIED (flagged, never silently dropped). Intent can only mark
+  // a finding "deliberate" with a citation; impact can only re-grade it, or call it negligible.
+  const confirmed = [];
+  const tally = { confirmed: 0, flagged: 0, refuted: 0, deliberate: 0, negligible: 0 };
+  const CONFIRMED_CHAR = { blocker: 'B', major: 'M', minor: 'm' };
+  const FLAGGED_CHAR = { blocker: 'b', major: 'j', minor: 'n' };
+  for (const f of unique) {
+    const vs = votes.get(f.id) || [];
+    const vC = voteOf(vs, 'correctness');
+    const vI = voteOf(vs, 'impact');
+    const vN = voteOf(vs, 'intent');
+    const expectAll = f.severity !== 'minor';
+    let st;
+    if (vC && !vC.holds) { st = 'r'; tally.refuted += 1; }
+    else if (vC && vN && !vN.holds && str(vN.citation).trim()) { st = 'd'; tally.deliberate += 1; f.deliberate = str(vN.citation, 300); }
+    else if (vC && vI && vI.severity === 'not-a-bug') { st = 'x'; tally.negligible += 1; }
+    else {
+      if (vI && SEV[vI.severity]) f.severity = vI.severity;
+      const flagged = !vC || (expectAll && (!vI || !vN));
+      f.flag = !vC ? 'UNVERIFIED — the correctness vote was lost; kept by fail-loud policy' : flagged ? 'PARTIALLY VERIFIED — an impact or intent vote was lost' : '';
+      st = flagged ? FLAGGED_CHAR[f.severity] : CONFIRMED_CHAR[f.severity];
+      tally[flagged ? 'flagged' : 'confirmed'] += 1;
+      f.verified_by = vC ? str(vC.evidence, 400) : '';
+      confirmed.push(f);
+    }
+    status[f.leaf][f.idx] = st;
+  }
+  log(`health[${GROUP}] verify: ${tally.confirmed} confirmed, ${tally.flagged} kept-flagged, ${tally.refuted} refuted, ${tally.deliberate} deliberate, ${tally.negligible} negligible`);
+
+  // ── synthesize: one warden per bucket, over VERIFIED findings only ──
+  phase('synthesize');
+  const buckets = new Map();
+  for (const f of confirmed) {
+    const b = bucketOf(f.violates);
+    if (!buckets.has(b)) buckets.set(b, []);
+    buckets.get(b).push(f);
+  }
+  const wardens = {};
+  const unclustered = {};
+  const minorThemes = {};
+  const scorecard = [];
+  await all(
+    [...buckets.entries()].map(([b, fs]) => async () => {
+      const key = `warden.${GROUP}.${b}`;
+      const ids = b === 'goals' ? TENET_IDS.concat(PERSONA_KEYS) : (GROUPS.find((g) => g.key === b) || { ids: [] }).ids;
+      const r = await tryAgent(
+        key,
+        `${TREE_RULES}
+
+You are the WARDEN for "${b}" in shard group "${GROUP}". Below are VERIFIED findings (refuters already tried to kill them). Your job is synthesis, not re-review:
+1. Cluster them into at most ${LIM.themes_per_warden} SYSTEMIC THEMES — the same N+1 in 7 routers is ONE theme with 7 members. A theme has a key (a short kebab-case id, unique among your themes — later stages cite the theme by it), names the pattern, why it matters for this codebase, the ids it violates, its severity (the worst member that the pattern really shares), a summary with the representative sites, and effort.
+2. EVERY finding id below must appear in the members of at least one theme — you may never drop a verified finding. A finding that fits no pattern gets its own theme.
+3. Rate each of these ids for the scorecard — holds / strained / violated / not-rated — with a one-line note: ${ids.join(', ') || '(none)'}.
+FINDINGS:
+${fs.map((f) => `[${f.id}] ${f.title} — ${f.file}${f.line ? ':' + f.line : ''} · ${f.severity} · ${f.violates.join(', ')} · effort ${f.effort}${f.flag ? ` · ${f.flag}` : ''}\n  ${f.evidence}${f.measured ? `\n  measured: ${f.measured}` : ''}`).join('\n')}
+${commitInstr(key, 'your result {themes, scorecard}')}`,
+        { label: key, phase: 'synthesize', schema: THEMES, effort: 'xhigh', ...M('warden', b), ...asLeaf, ...STALL_OPT },
+        hasSha,
+      );
+      if (!r) {
+        // A dead warden must not lose its findings: they all become unclustered, visible to verdict.
+        unclustered[b] = fs.map((f) => f.id);
+        cap('warden-dead', `${key}: ${fs.length} verified finding(s) left unclustered (still sealed and visible to the verdict)`);
+        return;
+      }
+      const themes = arr(r.themes).slice().sort((x, y) => sevRank(y.severity) - sevRank(x.severity));
+      const kept = themes.slice(0, LIM.themes_per_warden);
+      if (themes.length > kept.length) {
+        minorThemes[b] = themes.slice(kept.length).map((t) => ({ title: str(t.title, 160), members: arr(t.members).map(String) }));
+        cap('themes-over-cap', `${key} returned ${themes.length} themes; ${themes.length - kept.length} lower-severity theme(s) kept as minor_themes`);
+      }
+      const covered = new Set(themes.flatMap((t) => arr(t.members).map(String)));
+      const missed = fs.filter((f) => !covered.has(f.id)).map((f) => f.id);
+      if (missed.length) {
+        unclustered[b] = missed;
+        cap('warden-dropped', `${key} left ${missed.length} verified finding(s) out of every theme — re-attached as unclustered`);
+      }
+      // Theme keys are how the cluster cites a theme and how prep maps it to tenets: kebab-case, unique.
+      const usedKeys = new Set();
+      const themeKey = (raw, i) => {
+        const k = String(raw || '').toLowerCase().replace(/[^a-z0-9_.-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60) || `t${i + 1}`;
+        let u = k;
+        for (let n = 2; usedKeys.has(u); n++) u = `${k}-${n}`;
+        usedKeys.add(u);
+        return u;
+      };
+      wardens[b] = { key, stub_sha: r.stub_sha, themes: kept.map((t, ti) => ({ key: themeKey(t.key, ti), title: str(t.title, 200), severity: t.severity, members: arr(t.members).map(String).filter((m) => fs.some((f) => f.id === m)) })) };
+      const rated = new Set(arr(r.scorecard).map((s) => s.id));
+      for (const s of arr(r.scorecard)) if (ids.includes(s.id)) scorecard.push({ id: s.id, rating: s.rating, note: str(s.note, 200), bucket: b });
+      for (const id of ids) if (!rated.has(id)) scorecard.push({ id, rating: 'not-rated', note: 'the warden did not rate it', bucket: b });
+    }),
+  );
+
+  const leaves = {};
+  for (const { j, r } of live) leaves[j.leaf] = { key: j.key, stub_sha: r.stub_sha, st: status[j.leaf].join(''), applicable: r.applicable !== false };
+  for (const j of jobs) if (!leaves[j.leaf]) leaves[j.leaf] = { key: j.key, dead: true };
+  const sealed = await seal(`health-${GROUP}`, {
+    part: 'health',
+    group: GROUP,
+    depth: DEPTH,
+    legend: { B: 'confirmed blocker', M: 'confirmed major', m: 'confirmed minor', b: 'blocker, kept but flagged (a vote was lost)', j: 'major, kept but flagged', n: 'minor, kept but flagged', r: 'refuted', d: 'deliberate (documented decision)', x: 'negligible at real usage', u: 'exact duplicate of an earlier finding', o: 'over the per-finder cap', z: 'invalid (no citation, or outside the tree)' },
+    note: 'st[i] is the status of findings[i] in <bus>/<leaf key>.stub.json. Theme members are F###.i ids.',
+    leaves,
+    wardens,
+    unclustered,
+    minor_themes: minorThemes,
+    scorecard,
+    deliberate: unique.filter((f) => f.deliberate).map((f) => ({ id: f.id, citation: f.deliberate })),
+  });
+  return finish('complete', {
+    group: GROUP,
+    seal: { path: sealed.path, djb2: sealed.djb2, chars: sealed.chars },
+    seal_content: sealed.content,
+    counts: { jobs: jobs.length, live: live.length, findings: findings.length, unique: unique.length, ...tally, themes: Object.values(wardens).reduce((n, w) => n + w.themes.length, 0) },
+  });
+}
+
+// ════════════════════════════════════════════════════════════════════════════════════════════
+// PART: fidelity — every in-scope ghost's claims against the pinned code
+// ════════════════════════════════════════════════════════════════════════════════════════════
+const VERDICTS = ['delivered', 'partial', 'missing', 'divergent', 'superseded', 'regressed', 'misses_point', 'unverifiable'];
+// 'untested' is ENGINE-ONLY: a behavioral claim the verifier called delivered without a test. It is a
+// test gap (P-tested), not a false green — the code is there — so it never makes a ghost "not delivered".
+const ENGINE_VERDICTS = VERDICTS.concat(['untested']);
+const V_CHAR = { delivered: 'D', partial: 'P', missing: 'M', divergent: 'V', superseded: 'S', regressed: 'R', misses_point: 'X', unverifiable: 'U', untested: 'T' };
+const OPEN_J = ['already_done', 'still_needed', 'obsolete'];
+const CHARTER = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    claims: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          ghost_id: { type: 'string' },
+          text: { type: 'string' },
+          quote: { type: 'string' },
+          evidence_class: { type: 'string', enum: ['behavioral', 'doc', 'ui'] },
+        },
+        required: ['ghost_id', 'text', 'quote', 'evidence_class'],
+      },
+    },
+    stub_sha: { type: 'string' },
+  },
+  required: ['claims', 'stub_sha'],
+};
+const CHECKED = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    claims: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          k: { type: 'integer' },
+          verdict: { type: 'string', enum: VERDICTS },
+          code_ref: { type: 'string' },
+          test_ref: { type: 'string' },
+          evidence: { type: 'string' },
+        },
+        required: ['k', 'verdict', 'code_ref', 'test_ref', 'evidence'],
+      },
+    },
+    open_ghosts: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        properties: { ghost_id: { type: 'string' }, judgment: { type: 'string', enum: OPEN_J }, evidence: { type: 'string' } },
+        required: ['ghost_id', 'judgment', 'evidence'],
+      },
+    },
+    stub_sha: { type: 'string' },
+  },
+  required: ['claims', 'open_ghosts', 'stub_sha'],
+};
+const WALK = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    applicable: { type: 'boolean' },
+    observations: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        properties: { ghost_id: { type: 'string' }, point: { type: 'string' }, misses_point: { type: 'boolean' }, evidence: { type: 'string' } },
+        required: ['point', 'misses_point', 'evidence'],
+      },
+    },
+    stub_sha: { type: 'string' },
+  },
+  required: ['applicable', 'observations', 'stub_sha'],
+};
+const UNIT = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    intent_verdict: { type: 'string', enum: ['met', 'partly', 'missed', 'unknown'] },
+    sentence: { type: 'string' },
+    questions: { type: 'array', items: { type: 'string' } },
+    remaining: { type: 'array', items: { type: 'string' } },
+    stub_sha: { type: 'string' },
+  },
+  required: ['intent_verdict', 'sentence', 'questions', 'remaining', 'stub_sha'],
+};
+const OPEN_STATUSES = ['ether', 'active_haunt', 'purgatory', 'poltergeist'];
+
+async function runFidelity() {
+  const batches = arr(A.batches)
+    .filter((b) => b && b.file && arr(b.ghosts).length)
+    .map((b, i) => ({ n: Number(b.n) || i + 1, key: `B${pad(Number(b.n) || i + 1)}`, file: String(b.file), ghosts: arr(b.ghosts).map((g) => ({ id: String(g.id), status: String(g.status || ''), title: str(g.title, 200), units: arr(g.units).map(String) })) }));
+  const units = arr(A.units)
+    .filter((u) => u && u.key)
+    .map((u) => ({ key: String(u.key), kind: String(u.kind || ''), id: String(u.id || ''), name: str(u.name, 200), intent: str(u.intent, 2000), file: String(u.file || ''), kinds: arr(u.kinds).map(String) }));
+  if (!batches.length) throw new Error('reckoning fidelity: args.batches is empty — the skill writes one batch file per ~5 ghosts');
+  phase('fidelity');
+  const ghostById = new Map(batches.flatMap((b) => b.ghosts.map((g) => [g.id, { ...g, batch: b.key }])));
+  log(`fidelity: ${ghostById.size} ghost(s) in ${batches.length} batch(es), ${units.length} unit(s)`);
+
+  const INTENT_BLOCK = units.length ? `CONFIRMED INTENTS (what each Rite/Haunting was FOR — the Hunter confirmed these):\n${units.map((u) => `- ${u.key} "${u.name}": ${u.intent || '(no intent given)'}`).join('\n')}` : '';
+  const charterPrompt = (b) => `${TREE_RULES}
+
+You are the CHARTER reader for batch ${b.key}. Read ${b.file} — it holds ${b.ghosts.length} ghost(s) with their description, context_payload (objective, acceptance_criteria, files), Wisps, completion EVPs and linked PRs.
+Extract the ATOMIC, CHECKABLE claims each ghost makes: what it said would exist or be true once done. Sources, in order: acceptance_criteria, objective, description, then what the completion EVPs say was delivered. Take the criteria AS WRITTEN — a vague ghost simply yields fewer or vaguer claims; do not invent criteria it never stated.
+AT MOST ${LIM.claims_per_ghost} CLAIMS PER GHOST — the ones that carry the ghost's point. Merge trivia into the claim it belongs to, and skip run-result claims ("the suite passes", "the gate is green") unless they are all the ghost says: a read-only review cannot re-run them.
+Each claim: ghost_id (exactly as in the file), text (the claim, one sentence), quote (verbatim source text), evidence_class — behavioral (runtime behaviour: needs a code path AND a test to count as delivered), doc (documentation / prose / config text: needs the text present at a path), ui (a screen or interaction: needs the component).
+${commitInstr(`charter.${b.key}`, 'your result {claims}')}`;
+  const verifyPrompt = (b, claims) => `${TREE_RULES}
+
+${INTENT_BLOCK}
+
+You are the VERIFIER for batch ${b.key} (ghosts in ${b.file}; their files[] and linked-PR files are where to look FIRST, never the only place). For each claim, judge it against the PINNED code:
+- delivered: it exists and works as claimed. REQUIRED evidence: code_ref (path:line); for a behavioral claim also test_ref (the test that proves it) — without them the engine downgrades the verdict.
+- partial / missing: some or none of it exists.
+- divergent: built differently than specified, in a way that may be fine — say how.
+- superseded: later work deliberately replaced it (check later ghosts in ${SNAP}/backlog.json and the git history touching the same files) — say by what.
+- regressed: it was delivered once and is broken or gone now — cite the commit or the change.
+- misses_point: it exists as written but does not serve the intent above — say why.
+- unverifiable: the claim is too vague to check.
+Then, for every ghost in this batch whose status is ${OPEN_STATUSES.join(' / ')} (not exorcised), judge the ghost as a whole: already_done (the code already does it — cite where), still_needed, or obsolete (the product moved on — cite what replaced it).
+CLAIMS (k = index):
+${claims.filter((c) => !c.foreign).map((c) => `[${c.k}] ghost ${c.ghost_id} (${(ghostById.get(c.ghost_id) || {}).status || '?'}) · ${c.evidence_class}: ${c.text}\n    quote: "${str(c.quote, 400)}"`).join('\n')}
+OPEN GHOSTS TO JUDGE: ${b.ghosts.filter((g) => OPEN_STATUSES.includes(g.status)).map((g) => `${g.id} "${g.title}" (${g.status})`).join('; ') || '(none)'}
+${commitInstr(`verify.${b.key}`, 'your result {claims, open_ghosts}')}`;
+
+  // Per batch: charter → verify, pipelined (no barrier between batches).
+  const perBatch = await pipe(
+    batches,
+    async (b) => {
+      const r = await tryAgent(`charter.${b.key}`, charterPrompt(b), { label: `charter.${b.key}`, phase: 'fidelity', schema: CHARTER, effort: 'high', ...M('charter'), ...asLeaf }, hasSha);
+      if (!r) return null;
+      // Claims KEEP their index in the committed charter stub, so the seal's st[k] lines up with the
+      // file the verdict reads. A claim naming a ghost outside the batch keeps its slot as 'F'.
+      const ids = new Set(b.ghosts.map((g) => g.id));
+      const perGhost = new Map();
+      const claims = arr(r.claims).map((c, k) => {
+        const foreign = !ids.has(String(c.ghost_id));
+        if (foreign) cap('claim-foreign-ghost', `charter.${b.key}[${k}] named ghost ${str(c.ghost_id, 40)}, which is not in the batch — claim dropped`);
+        const n = (perGhost.get(String(c.ghost_id)) || 0) + 1;
+        perGhost.set(String(c.ghost_id), n);
+        // Over the per-ghost cap: kept in the stub (index alignment), sealed as 'C', never checked.
+        const overCap = !foreign && n > LIM.claims_per_ghost;
+        return { k, foreign: foreign || overCap, capped: overCap, ghost_id: String(c.ghost_id), text: str(c.text, 600), quote: str(c.quote, 800), evidence_class: ['behavioral', 'doc', 'ui'].includes(c.evidence_class) ? c.evidence_class : 'behavioral' };
+      });
+      for (const [gid, n] of perGhost) if (n > LIM.claims_per_ghost && ids.has(gid)) cap('claims-over-cap', `charter.${b.key}: ghost ${gid.slice(0, 8)} yielded ${n} claims; the ${n - LIM.claims_per_ghost} after the first ${LIM.claims_per_ghost} are not checked`);
+      const withClaims = new Set(claims.filter((c) => !c.foreign).map((c) => c.ghost_id));
+      for (const g of b.ghosts) if (!withClaims.has(g.id) && g.status === 'exorcised') cap('ghost-without-claims', `${g.id} "${g.title}" yielded no checkable claim`);
+      return { b, charter: r, claims };
+    },
+    async (prev) => {
+      const { b, claims } = prev;
+      const r = await tryAgent(`verify.${b.key}`, verifyPrompt(b, claims), { label: `verify.${b.key}`, phase: 'fidelity', schema: CHECKED, effort: 'high', ...M('verifier'), ...asLeaf }, hasSha);
+      return { ...prev, verify: r };
+    },
+  );
+
+  // Engine-owned evidence rules, then the claim table.
+  const claims = []; // {id, batch, k, ghost_id, evidence_class, verdict, code_ref, test_ref, evidence}
+  const openJudgments = []; // {id, ghost_id, judgment, evidence}
+  for (const x of perBatch.filter(Boolean)) {
+    const byK = new Map(arr(x.verify && x.verify.claims).map((c) => [c.k, c]));
+    x.claims.forEach((c) => {
+      const k = c.k;
+      if (c.foreign) { claims.push({ id: `${x.b.key}.${k}`, batch: x.b.key, k, foreign: true, capped: !!c.capped, ghost_id: c.ghost_id, evidence_class: c.evidence_class, text: c.text, verdict: 'foreign' }); return; }
+      const v = byK.get(k);
+      let verdict = v && VERDICTS.includes(v.verdict) ? v.verdict : 'unverifiable';
+      if (!v) cap('claim-unjudged', `${x.b.key}[${k}] got no verdict${x.verify ? '' : ' (the verifier died)'}`);
+      const codeRef = v ? relPath(v.code_ref) : '';
+      const testRef = v ? relPath(v.test_ref) : '';
+      if (verdict === 'delivered' && !insideTree(codeRef.split(':')[0])) {
+        verdict = 'unverifiable';
+        cap('delivered-without-evidence', `${x.b.key}[${k}] was called delivered with no code_ref under the tree — downgraded to unverifiable`);
+      } else if (verdict === 'delivered' && c.evidence_class === 'behavioral' && !insideTree(testRef.split(':')[0])) {
+        verdict = 'untested';
+        cap('delivered-untested', `${x.b.key}[${k}] behavioral claim "delivered" with no test_ref — recorded as untested (a test gap, not a false green)`);
+      }
+      claims.push({ id: `${x.b.key}.${k}`, batch: x.b.key, k, ghost_id: c.ghost_id, evidence_class: c.evidence_class, text: c.text, verdict, code_ref: codeRef, test_ref: testRef, evidence: v ? str(v.evidence, 1200) : '' });
+    });
+    for (const o of arr(x.verify && x.verify.open_ghosts)) {
+      const g = ghostById.get(String(o.ghost_id));
+      if (!g || !OPEN_STATUSES.includes(g.status) || !OPEN_J.includes(o.judgment)) {
+        cap('open-judgment-invalid', `${x.b.key}: judgment for ${str(o.ghost_id, 40)} dropped (not an open ghost of this batch)`);
+        continue;
+      }
+      if (openJudgments.some((j) => j.ghost_id === g.id)) { cap('open-judgment-duplicate', `${x.b.key}: a second judgment for ${g.id} ignored`); continue; }
+      openJudgments.push({ id: `O.${g.id}`, ghost_id: g.id, judgment: o.judgment, evidence: str(o.evidence, 1200) });
+    }
+  }
+  for (const x of perBatch.filter((y) => y && y.verify)) for (const g of x.b.ghosts) if (OPEN_STATUSES.includes(g.status) && !openJudgments.some((o) => o.ghost_id === g.id)) cap('open-ghost-unjudged', `${x.b.key}: open ghost ${g.id} "${g.title}" got no already-done / still-needed / obsolete judgment`);
+  const deadBatches = batches.filter((b) => !perBatch.some((x) => x && x.b.key === b.key && x.verify));
+  const minLive = Math.ceil(batches.length * MIN_LIVE_RATIO);
+  if (batches.length - deadBatches.length < minLive) {
+    const reason = `only ${batches.length - deadBatches.length}/${batches.length} batch(es) were chartered and verified (need ${minLive})`;
+    log(`fidelity ABORT — ${reason}`);
+    return finish('aborted', { reason });
+  }
+
+  // ── persona walkthroughs (standard depth), in parallel with nothing left to wait for ──
+  const walks = [];
+  if (DEPTH === 'standard' && PERSONAS.length && units.length) {
+    // Rites only (a Haunting is a container; a Rite is a delivery with a point to miss), and only the
+    // personas whose kinds meet the Rite's footprint — most overlap first, at most walks_per_rite.
+    const walkJobs = [];
+    units.forEach((u, ui) => {
+      if (u.kind !== 'rite') return;
+      const ranked = PERSONAS.map((p) => ({ p, overlap: p.kinds.filter((k) => u.kinds.includes(k)).length }))
+        .filter((x) => x.overlap > 0)
+        .sort((a, b) => b.overlap - a.overlap || Number(b.p.reasoning) - Number(a.p.reasoning));
+      if (!ranked.length) { cap('walk-no-footprint', `${u.name}: no persona matches its footprint kinds (${u.kinds.join(',') || 'none known'}) — no walkthrough`); return; }
+      ranked.slice(0, LIM.walks_per_rite).forEach(({ p }) => walkJobs.push({ key: `walk.U${pad(ui + 1, 2)}.${p.key}`, u, p }));
+    });
+    const res = await all(
+      walkJobs.map((w) => async () => {
+        const r = await tryAgent(
+          w.key,
+          `${TREE_RULES}
+
+You are the persona "${w.p.key}" (definition: ${w.p.file || 'infer from the key'}). WALK what the ${w.u.kind} "${w.u.name}" delivered, in the pinned code, as this persona would meet it. Its ghosts are listed in ${w.u.file || `${SNAP}/scope.json`}.
+Its confirmed intent: ${w.u.intent || '(none given — judge against its description)'}
+Report observations in your own voice: where it serves the intent, and where it MISSES THE POINT (built as written, but not what this persona needed). Cite code. If none of it is your surface, return applicable=false — a valid, cheap answer.
+${commitInstr(w.key, 'your result {applicable, observations}')}`,
+          { label: w.key, phase: 'fidelity', schema: WALK, effort: 'high', ...M(w.p.reasoning ? 'reasoning_persona' : 'walk', w.p.key), ...asLeaf },
+          hasSha,
+        );
+        return r ? { ...w, r } : null;
+      }),
+    );
+    walks.push(...res.filter(Boolean));
+  }
+
+  // ── verify verdicts: batched refuters ──
+  phase('verify');
+  const exorcised = (gid) => (ghostById.get(gid) || {}).status === 'exorcised';
+  const tasks = [];
+  const skepticGhosts = new Map(); // ghost id -> its delivered claims (exorcised ghosts only)
+  for (const c of claims.filter((x) => !x.foreign)) {
+    const text = (retry) => `[${c.id}] ghost ${c.ghost_id} (${(ghostById.get(c.ghost_id) || {}).status || '?'}) · ${c.evidence_class}: ${c.text}\n  verdict: ${c.verdict}${c.code_ref ? ` · code ${c.code_ref}` : ''}${c.test_ref ? ` · test ${c.test_ref}` : ''}\n  ${retry ? '' : `verifier's evidence: ${c.evidence}`}`;
+    // Only a NEGATIVE verdict is searched: "divergent" and "superseded" are descriptive (overturning them
+    // to delivered would be wrong by construction), "untested" is an engine fact, and "misses_point"
+    // is a judgment about intent, not existence — it gets its own lens.
+    if (['missing', 'partial', 'regressed'].includes(c.verdict)) {
+      for (const slot of [0, 1]) tasks.push({ id: c.id, lens: 'search', slot, text });
+    } else if (c.verdict === 'misses_point') {
+      for (const slot of [0, 1]) tasks.push({ id: c.id, lens: 'intent', slot, text });
+    } else if (c.verdict === 'delivered' && exorcised(c.ghost_id)) {
+      if (!skepticGhosts.has(c.ghost_id)) skepticGhosts.set(c.ghost_id, []);
+      skepticGhosts.get(c.ghost_id).push(c);
+    }
+  }
+  // ONE skeptic per exorcised ghost, reading all of its delivered claims together (two ghosts per
+  // call); survey samples every other ghost. A ghost-level dispute names the claim ids that fail.
+  let skepticN = 0;
+  for (const [gid, cs] of skepticGhosts) {
+    skepticN += 1;
+    if (DEPTH === 'survey' && skepticN % 2 === 0) continue;
+    const g = ghostById.get(gid) || {};
+    const text = (retry) => `[G.${gid}] exorcised ghost "${g.title || ''}" — its DELIVERED claims:\n${cs.map((c) => `  ${c.id} · ${c.evidence_class}: ${c.text}${c.code_ref ? ` · code ${c.code_ref}` : ''}${c.test_ref ? ` · test ${c.test_ref}` : ''}`).join('\n')}`;
+    tasks.push({ id: `G.${gid}`, lens: 'skeptic', slot: 0, text, claims: cs.map((c) => c.id) });
+  }
+  for (const o of openJudgments.filter((o) => o.judgment !== 'still_needed')) {
+    const text = () => `[${o.id}] open ghost ${o.ghost_id} "${(ghostById.get(o.ghost_id) || {}).title || ''}" judged ${o.judgment}\n  evidence: ${o.evidence}`;
+    for (const slot of [0, 1]) tasks.push({ id: o.id, lens: 'open', slot, text });
+  }
+  if (DEPTH === 'survey' && skepticN > 1) cap('skeptic-sampled', `survey depth: every other one of ${skepticN} exorcised ghost(s) got a skeptic`);
+  const LENS = {
+    search: 'Each claim below was judged missing, partial or regressed. SEARCH HARDER before accepting that: renamed? moved? done differently elsewhere? holds=true if the verdict stands; holds=false only if you found the claim fully delivered — put the path:line AND, for a behavioral claim, the test that proves it in evidence.',
+    intent: `Each claim below exists as written but was judged to MISS THE POINT of its Rite/Haunting. The confirmed intents:\n${units.map((u) => `- ${u.key} "${u.name}": ${u.intent || '(none given)'}`).join('\n')}\nholds=true if it really does not serve that intent; holds=false if it does serve it (say how).`,
+    skeptic: 'Each item below is a ghost marked DONE with the claims a verifier judged DELIVERED. Try to prove any of them is NOT: is the cited code really doing it, is the test really testing it, is it reachable? One verdict per ghost id: holds=true if every listed claim is delivered; holds=false if any is not — put the failing claim ids (e.g. B003.2, B003.4) in citation and the gap in evidence.',
+    open: 'Each OPEN ghost below was judged already done or obsolete — which would close it. Check that claim against the code and the backlog snapshot. holds=true if the judgment stands; holds=false if the ghost is in fact still needed (say what is missing).',
+  };
+  const lensPrompt = (lens, items, retry) => `${retry ? 'You are an independent second reader checking an audit of a codebase against its task tracker.' : 'You are an ADVERSARIAL VERIFIER of an audit of a codebase against its task tracker.'}
+${TREE_RULES.split('\n').slice(0, 4).join('\n')}
+The ghosts' full records are in ${SNAP}/backlog.json and the batch files under ${SNAP}/fidelity/.
+${LENS[lens]}
+Return one verdict per id.
+ITEMS:
+${items.map((t) => t.text(retry)).join('\n\n')}`;
+  const votes = await refute(tasks, lensPrompt, 'fidelity');
+
+  // Tally. A negative verdict stands unless its WHOLE quorum overturns it (two live votes, both
+  // showing delivery); a lost vote keeps it, flagged. A skeptic can only DISPUTE a delivered claim
+  // (a question for the Hunter), never reopen a ghost by itself.
+  let overturned = 0;
+  let disputed = 0;
+  for (const c of claims) {
+    const vs = votes.get(c.id);
+    if (!vs) continue;
+    if (c.verdict === 'delivered') continue; // judged per ghost, below
+    const live = vs.filter((x) => x.v);
+    if (live.length === 2 && live.every((x) => !x.v.holds)) {
+      c.overturned_from = c.verdict;
+      // A search that overturns a behavioral claim must name its test, or it only proves the code exists.
+      c.verdict = c.verdict !== 'misses_point' && c.evidence_class === 'behavioral' && !/test/i.test(live.map((x) => x.v.evidence).join(' ')) ? 'untested' : 'delivered';
+      c.evidence = str(live[0].v.evidence, 800);
+      overturned += 1;
+    } else if (live.length < 2) c.flag = live.length ? 'PARTIALLY VERIFIED — one verification vote was lost' : 'UNVERIFIED — both verification votes were lost';
+  }
+  for (const t of tasks.filter((x) => x.lens === 'skeptic')) {
+    const v = voteOf(votes.get(t.id), 'skeptic');
+    const mine = claims.filter((c) => t.claims.includes(c.id));
+    if (!v) { for (const c of mine) c.flag = 'UNVERIFIED — the skeptic vote for this ghost was lost'; continue; }
+    if (v.holds) continue;
+    const named = new Set((str(v.citation, 2000).match(/B\d{3}\.\d+/g) || []).filter((id) => t.claims.includes(id)));
+    for (const c of mine) if (!named.size || named.has(c.id)) { c.disputed = str(v.evidence, 600); disputed += 1; }
+  }
+  for (const o of openJudgments) {
+    const vs = votes.get(o.id);
+    if (!vs) continue;
+    const live = vs.filter((x) => x.v);
+    if (live.length === 2 && live.every((x) => !x.v.holds)) { o.overturned_from = o.judgment; o.judgment = 'still_needed'; }
+    else if (live.length < 2) o.flag = 'UNVERIFIED — a vote was lost; a state change needs a full quorum';
+  }
+  log(`fidelity verify: ${overturned} verdict(s) overturned to delivered, ${disputed} delivered claim(s) disputed`);
+
+  // ── per-unit wardens. The NUMBERS are the engine's; the warden only writes the words. ──
+  phase('synthesize');
+  const unitNumbers = (u) => {
+    const gs = [...ghostById.values()].filter((g) => g.units.includes(u.key));
+    const done = gs.filter((g) => g.status === 'exorcised');
+    const cl = (g) => claims.filter((c) => c.ghost_id === g.id && !c.foreign);
+    const falseGreen = done.filter((g) => cl(g).some((c) => ['missing', 'regressed', 'partial'].includes(c.verdict) && !c.flag));
+    // "Code confirms" = no VERIFIED negative claim and nothing disputed. An unverifiable claim (vague
+    // criteria) neither confirms nor refutes the ghost — it must not hold a delivered ghost hostage.
+    const confirmedDone = done.filter((g) => cl(g).some((c) => ['delivered', 'superseded', 'divergent', 'untested'].includes(c.verdict)) && !cl(g).some((c) => ['missing', 'partial', 'regressed', 'misses_point'].includes(c.verdict) || c.disputed || c.flag));
+    const openDone = openJudgments.filter((o) => o.judgment === 'already_done' && !o.flag && gs.some((g) => g.id === o.ghost_id));
+    const obsolete = openJudgments.filter((o) => o.judgment === 'obsolete' && !o.flag && gs.some((g) => g.id === o.ghost_id));
+    return {
+      ghosts: gs.length,
+      exorcised: done.length,
+      code_confirms: confirmedDone.length,
+      false_greens: falseGreen.map((g) => g.id),
+      open_already_done: openDone.map((o) => o.ghost_id),
+      open_obsolete: obsolete.map((o) => o.ghost_id),
+      misses_point: claims.filter((c) => gs.some((g) => g.id === c.ghost_id) && c.verdict === 'misses_point').map((c) => c.id),
+      disputed: claims.filter((c) => gs.some((g) => g.id === c.ghost_id) && c.disputed).map((c) => c.id),
+      untested: claims.filter((c) => gs.some((g) => g.id === c.ghost_id) && c.verdict === 'untested').map((c) => c.id),
+    };
+  };
+  const unitOut = {};
+  await all(
+    units.map((u, ui) => async () => {
+      const nums = unitNumbers(u);
+      const key = `unit.U${pad(ui + 1, 2)}`;
+      const mine = claims.filter((c) => (ghostById.get(c.ghost_id) || { units: [] }).units.includes(u.key));
+      const myWalks = walks.filter((w) => w.u.key === u.key && w.r.applicable !== false);
+      const r = await tryAgent(
+        key,
+        `${TREE_RULES}
+
+You are the WARDEN for ${u.kind} "${u.name}". Its confirmed intent: ${u.intent || '(none given)'}
+The NUMBERS below are computed by the engine and are final — do not recount or restate them differently:
+  platform says ${nums.exorcised}/${nums.ghosts} exorcised; code confirms ${nums.code_confirms}; ${nums.false_greens.length} false green(s); ${nums.open_already_done.length} open ghost(s) already done; ${nums.open_obsolete.length} obsolete.
+Your job: (1) intent_verdict — is the intent met, partly met, missed, or unknown — and ONE sentence saying why, in plain words; (2) questions — every "misses the point" concern as a QUESTION for the Hunter (never as a task), from the misses_point claims and the persona walkthroughs; (3) remaining — what is genuinely left to do, worst first.
+CLAIMS (id · ghost · verdict · evidence):
+${mine.map((c) => `${c.id} · ${c.ghost_id} · ${c.verdict}${c.flag ? ' (' + c.flag + ')' : ''}${c.disputed ? ' (DISPUTED: ' + str(c.disputed, 200) + ')' : ''} · ${str(c.text, 200)}`).join('\n') || '(none)'}
+PERSONA WALKTHROUGHS: ${myWalks.map((w) => `${w.p.key}: ${arr(w.r.observations).map((o) => `${o.misses_point ? 'MISSES — ' : ''}${str(o.point, 300)}`).join(' | ')}`).join('\n') || '(none)'}
+${commitInstr(key, 'your result {intent_verdict, sentence, questions, remaining}')}`,
+        { label: key, phase: 'synthesize', schema: UNIT, effort: 'xhigh', ...M('unit_warden'), ...asLeaf, ...STALL_OPT },
+        hasSha,
+      );
+      unitOut[u.key] = { warden: key, stub_sha: r ? r.stub_sha : null, intent_verdict: r ? r.intent_verdict : 'unknown', numbers: nums, questions: r ? arr(r.questions).length : 0 };
+      if (!r) cap('unit-warden-dead', `${key} (${u.name}): headline numbers are sealed without the warden's intent verdict`);
+    }),
+  );
+
+  const batchSeal = {};
+  for (const b of batches) {
+    const x = perBatch.find((y) => y && y.b.key === b.key);
+    const mine = claims.filter((c) => c.batch === b.key).sort((p, q) => p.k - q.k);
+    batchSeal[b.key] = x
+      ? { charter: `charter.${b.key}`, charter_sha: x.charter.stub_sha, verify: x.verify ? `verify.${b.key}` : null, verify_sha: x.verify ? x.verify.stub_sha : null, st: mine.map((c) => (c.capped ? 'C' : c.foreign ? 'F' : c.flag ? V_CHAR[c.verdict].toLowerCase() : V_CHAR[c.verdict])).join('') }
+      : { dead: true };
+  }
+  const SLICE = Number(A.slice) > 0 ? Number(A.slice) : 0;
+  const sealed = await seal(SLICE ? `fidelity-${SLICE}` : 'fidelity', {
+    part: 'fidelity',
+    depth: DEPTH,
+    legend: { D: 'delivered', P: 'partial', M: 'missing', V: 'divergent', S: 'superseded', R: 'regressed', X: 'misses_point', U: 'unverifiable', T: 'untested (delivered code, no test — a test gap, not a false green)', F: 'dropped: named a ghost outside the batch', C: 'over the per-ghost claim cap — not checked', lowercase: 'same verdict, but a verification vote was lost (flagged)' },
+    note: 'st[k] is the final verdict of claims[k] in <bus>/charter.<batch>.stub.json. overturned/disputed/open are keyed by claim id B###.k or ghost id.',
+    batches: batchSeal,
+    overturned: claims.filter((c) => c.overturned_from).map((c) => ({ id: c.id, from: c.overturned_from })),
+    disputed: claims.filter((c) => c.disputed).map((c) => ({ id: c.id, ghost_id: c.ghost_id, why: c.disputed })),
+    open: openJudgments.map((o) => ({ ghost_id: o.ghost_id, judgment: o.judgment, flag: o.flag || '', from: o.overturned_from || '' })),
+    units: unitOut,
+    walks: walks.map((w) => ({ key: w.key, unit: w.u.key, persona: w.p.key, stub_sha: w.r.stub_sha, applicable: w.r.applicable !== false })),
+  });
+  const verdictCounts = {};
+  for (const c of claims.filter((x) => !x.foreign)) verdictCounts[c.verdict] = (verdictCounts[c.verdict] || 0) + 1;
+  return finish('complete', {
+    seal: { path: sealed.path, djb2: sealed.djb2, chars: sealed.chars },
+    seal_content: sealed.content,
+    counts: { ghosts: ghostById.size, batches: batches.length, dead_batches: deadBatches.length, claims: claims.length, verdicts: verdictCounts, overturned, disputed, open_judgments: openJudgments.length, units: units.length, walks: walks.length },
+  });
+}
+
+// ════════════════════════════════════════════════════════════════════════════════════════════
+// PART: imprints — reconcile the Coven's memory with the pinned code
+// ════════════════════════════════════════════════════════════════════════════════════════════
+const MEMORY_TYPES = ['fact', 'convention', 'preference', 'gotcha', 'procedure'];
+const JURIS = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    items: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        properties: { id: { type: 'string' }, jurisdiction: { type: 'string', enum: ['this_repo', 'other_repo', 'process'] }, why: { type: 'string' } },
+        required: ['id', 'jurisdiction', 'why'],
+      },
+    },
+  },
+  required: ['items'],
+};
+const OPS = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    ops: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          target: { type: 'string' },
+          op: { type: 'string', enum: ['keep', 'edit', 'supersede', 'banish', 'duplicate_of', 'promote'] },
+          dup_of: { type: 'string' },
+          new_title: { type: 'string' },
+          new_content: { type: 'string' },
+          new_type: { type: 'string' },
+          new_tags: { type: 'array', items: { type: 'string' } },
+          new_links: { type: 'array', items: { type: 'object', additionalProperties: false, properties: { kind: { type: 'string', enum: ['task', 'document'] }, id: { type: 'string' } }, required: ['kind', 'id'] } },
+          new_scope: { type: 'string', enum: ['org', 'project', 'agent'] },
+          new_project_id: { type: 'string' },
+          reason: { type: 'string' },
+          evidence: { type: 'string' },
+        },
+        required: ['target', 'op', 'reason', 'evidence'],
+      },
+    },
+    stub_sha: { type: 'string' },
+  },
+  required: ['ops', 'stub_sha'],
+};
+
+// Mirrors memory_service._supersede_scope_ok: a replacement keeps or WIDENS scope, never moves
+// sideways. The server checks only the supersede target, so a merge (supersede A, banish B) must be
+// checked against BOTH here or it silently narrows B's scope. Pinned by engine-exec tests.
+const scopeOk = (target, repl) => {
+  if (!target || !repl) return false;
+  if (target.scope === 'org') return repl.scope === 'org';
+  if (target.scope === 'project') return repl.scope === 'org' || (repl.scope === 'project' && !!repl.project_id && repl.project_id === target.project_id);
+  return repl.scope !== 'agent' || (!!repl.agent_id && repl.agent_id === target.agent_id);
+};
+// A stray project_id is KEPT, not normalized away, so "org + project_id" is rejected below exactly as
+// it is for a new Imprint — the agent's intent (org? or this Haunting?) is ambiguous, and guessing
+// either way can publish a fact at the wrong scope.
+const replacementShape = (op, target) => {
+  const scope = op.new_scope || target.scope;
+  return {
+    scope,
+    project_id: op.new_project_id ? String(op.new_project_id) : scope === 'project' ? target.project_id || '' : '',
+    agent_id: scope === 'agent' ? target.agent_id || '' : '',
+  };
+};
+const validateImprintText = (title, content, type) => {
+  const t = String(title || '');
+  const c = String(content || '');
+  if (!t.trim() || t.length > 200) return `title must be 1-200 chars (got ${t.length})`;
+  if (!c.trim() || c.length > 2000) return `content must be 1-2000 chars (got ${c.length})`;
+  if (!MEMORY_TYPES.includes(type)) return `memory_type must be one of ${MEMORY_TYPES.join('/')} (got ${str(type, 30)}) — decisions belong to Auguries`;
+  return '';
+};
+
+async function runImprints() {
+  const index = new Map(
+    arr(A.imprints)
+      .filter((m) => m && m.id)
+      .map((m) => [String(m.id), { id: String(m.id), title: str(m.title, 200), scope: String(m.scope || ''), project_id: String(m.project_id || ''), agent_id: String(m.agent_id || ''), memory_type: String(m.memory_type || ''), self: !!m.self, promoted: !!m.promoted, links: arr(m.links) }]),
+  );
+  const HAUNTINGS = new Set(arr(A.hauntings_in_scope).map(String));
+  const KNOWN_TASKS = new Set(arr(A.known_task_ids).map(String));
+  if (!index.size) {
+    log('imprints: no in-scope Imprints — nothing to reconcile');
+    const sealed = await seal('imprints', { part: 'imprints', jurisdiction: {}, checks: {}, ops: [], invalid: [] });
+    return finish('complete', { seal: { path: sealed.path, djb2: sealed.djb2, chars: sealed.chars }, seal_content: sealed.content, counts: { imprints: 0 } });
+  }
+  phase('imprints');
+  const FILE = `${SNAP}/imprints.json`;
+
+  // 1. Jurisdiction — seance posture only, org Imprints only. Project Imprints of in-scope Hauntings
+  //    are this repo's by construction; in coven posture the whole Coven is this repo.
+  const jur = {}; // id -> 'T' | 'O' | 'P' | '?'
+  for (const m of index.values()) jur[m.id] = 'T';
+  if (POSTURE === 'seance') {
+    const orgIds = [...index.values()].filter((m) => m.scope === 'org').map((m) => m.id);
+    const res = await all(
+      chunk(orgIds, 10).map((ids, bi) => async () => {
+        const key = `juris.${pad(bi + 1)}`;
+        const r = await tryAgent(
+          key,
+          `${TREE_RULES}
+
+The Coven these Imprints live in holds SEVERAL repositories' Mediums; this reckoning audits only the "${REPO}" repo, pinned at ${TREE}.${A.repo_map ? `\nWHAT THIS REPO CONTAINS: ${str(A.repo_map, 1500)} — tooling that LIVES here (a plugin, its skills, its workflow engines) is this repo too.` : ''}
+For each Imprint id below (full records in ${FILE}), decide: this_repo (it is about this codebase — its files, APIs, conventions, tooling or product), other_repo (it is about a different codebase or product), or process (general working practice not tied to one codebase). When unsure between this_repo and other_repo, grep the pinned tree for the files / identifiers it names: found here → this_repo.
+IDS: ${ids.join(', ')}`,
+          { label: key, phase: 'imprints', schema: JURIS, effort: 'medium', ...M('juris') },
+          (x) => Array.isArray(x.items),
+        );
+        return { ids, r };
+      }),
+    );
+    for (const x of res.filter(Boolean)) {
+      const got = new Map(arr(x.r && x.r.items).map((i) => [String(i.id), i.jurisdiction]));
+      for (const id of x.ids) {
+        const j = got.get(id);
+        jur[id] = j === 'this_repo' ? 'T' : j === 'other_repo' ? 'O' : j === 'process' ? 'P' : '?';
+        // Unclassified = untouched. Judging another repo's Imprint against this code is how a true
+        // fact about one repo gets banished by another repo's audit.
+      }
+    }
+    const unknown = Object.values(jur).filter((j) => j === '?').length;
+    if (unknown) cap('jurisdiction-unknown', `${unknown} org Imprint(s) could not be classified and are left untouched`);
+  }
+  const inJur = [...index.values()].filter((m) => jur[m.id] === 'T');
+  log(`imprints: ${index.size} in scope, ${inJur.length} in jurisdiction`);
+
+  // 2. Check, in batches of 6.
+  const checks = await all(
+    chunk(inJur, 6).map((ms, bi) => async () => {
+      const key = `check.C${pad(bi + 1)}`;
+      const r = await tryAgent(
+        key,
+        `${TREE_RULES}
+
+You reconcile the Coven's IMPRINTS (atomic memory records agents recall at task start) with the code as it is NOW. Full records are in ${FILE}. You have the WHOLE toolkit — use it actively; "keep" is right only when an Imprint needs nothing at all. For EACH Imprint id below return exactly one op:
+- keep — still true, well-cited, well-linked and useful exactly as written.
+- edit — the FACT still holds but the wording, citations (stale path:line), memory_type, tags or links are off: send only the fields that change (new_title, new_content, new_type, new_tags, new_links = the FULL replacement link list [{kind: task|document, id}] — relink it to the ghosts and Scrolls it is about). An edit cannot change scope.
+- supersede — the FACT itself changed, or the scope must WIDEN: draft the corrected replacement (new_title ≤200 chars, new_content ≤2000 chars, new_type one of ${MEMORY_TYPES.join('/')}). A replacement may keep or WIDEN scope, never move sideways: an org Imprint stays org; a project Imprint stays in its Haunting (new_project_id = its project_id) or widens to org (no project_id).
+- promote — it is really a long procedure or reference that belongs in a Scroll (the Imprint stays; a Scroll is created from it).
+- banish — false now, or obsolete (the thing it describes is gone).
+- duplicate_of — it says the same thing as another in-scope Imprint (dup_of = that id). THE TARGET (this id) IS THE ONE RETIRED; dup_of is the one kept. So put the weaker / contained Imprint as the target. If dup_of already says everything, leave new_content empty (the target is simply retired); otherwise draft the combined text as a supersede of dup_of (new_title / new_content / new_type), whose scope must cover BOTH (org if they sit in different Hauntings).
+An Imprint is a FACT about the code today — never a recommendation, never a decision (those are Auguries). Cite the code in evidence.
+HARD LIMITS (the API rejects anything over them, and so does the engine): new_title 1-200 characters, new_content 1-2000 characters. Models miscount, so MEASURE: after writing your draft, run  bash "${BUS_SCRIPT}" lint-imprints "${BUS}/.tmp/${key}.json"  and shorten whatever it reports until it prints ok:true — then commit.
+IDS: ${ms.map((m) => `${m.id} [${m.scope}${m.project_id ? ' ' + m.project_id.slice(0, 8) : ''}] "${m.title}"`).join('\n')}
+${commitInstr(key, 'your result {ops}')}`,
+        { label: key, phase: 'imprints', schema: OPS, effort: 'high', ...M('checker'), ...asLeaf },
+        hasSha,
+      );
+      return { key, ms, r };
+    }),
+  );
+
+  const liveChecks = checks.filter((x) => x && x.r).length;
+  const checkBatches = Math.ceil(inJur.length / 6);
+  if (checkBatches && liveChecks < Math.ceil(checkBatches * MIN_LIVE_RATIO)) {
+    const reason = `only ${liveChecks}/${checkBatches} Imprint check batch(es) returned (need ${Math.ceil(checkBatches * MIN_LIVE_RATIO)})`;
+    log(`imprints ABORT — ${reason}`);
+    return finish('aborted', { reason });
+  }
+
+  const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  const validLinks = (links, target) => {
+    const had = new Set(arr(target && target.links).map((l) => `${l.kind}:${l.id}`));
+    for (const l of arr(links)) {
+      if (!l || !['task', 'document'].includes(l.kind) || !UUID.test(str(l.id).trim())) return 'a link needs kind task|document and a uuid id';
+      // A citation the Imprint already carries stays valid even if its ghost is outside this snapshot.
+      if (l.kind === 'task' && KNOWN_TASKS.size && !KNOWN_TASKS.has(String(l.id)) && !had.has(`task:${l.id}`)) return `link names ghost ${str(l.id, 40)}, which is not in the backlog snapshot`;
+    }
+    return arr(links).length > 20 ? 'at most 20 links' : '';
+  };
+  const validTags = (tags) => (arr(tags).length > 20 ? 'at most 20 tags' : arr(tags).some((t) => !str(t).trim() || str(t).length > 50) ? 'tags are 1-50 chars' : '');
+  // 3. Engine-owned validity. Every rule here is a server 4xx the apply step would otherwise hit
+  //    mid-batch (an all-or-nothing batch fails whole), or a scope narrowing the server never sees.
+  const ops = [];
+  const invalid = [];
+  const touched = new Set();
+  const checkSeal = {};
+  for (const x of checks.filter(Boolean)) {
+    if (!x.r) { for (const m of x.ms) invalid.push({ target: m.id, why: 'unchecked — the checker died' }); continue; }
+    checkSeal[x.key] = { stub_sha: x.r.stub_sha, ids: x.ms.map((m) => m.id) };
+    const got = new Set();
+    arr(x.r.ops).forEach((o, i) => {
+      const k = `${x.key}.${i}`;
+      const t = index.get(String(o.target));
+      const bad = (why) => { invalid.push({ k, target: str(o.target, 40), op: o.op, why }); cap('imprint-op-invalid', `${k} ${o.op} ${str(o.target, 12)}: ${why}`); };
+      if (!t || !x.ms.some((m) => m.id === t.id)) return bad('target is not one of this batch\'s in-scope Imprints');
+      got.add(t.id);
+      if (o.op === 'keep') return;
+      if (touched.has(t.id)) return bad('a second op on the same Imprint');
+      if (o.op === 'banish') { touched.add(t.id); ops.push({ k, target: t.id, op: 'banish', reason: str(o.reason, 600), evidence: str(o.evidence, 1200) }); return; }
+      if (o.op === 'edit') {
+        if (o.new_scope && o.new_scope !== t.scope) return bad('an edit cannot change scope — use supersede to widen');
+        // Only NON-EMPTY fields are changes. Structured output fills optional fields with "" and [] when
+        // it means "no change", and an empty tags/links list would WIPE the Imprint's citations in prod.
+        const changes = {};
+        if (str(o.new_title).trim()) changes.title = String(o.new_title);
+        if (str(o.new_content).trim()) changes.content = String(o.new_content);
+        if (str(o.new_type).trim()) changes.memory_type = String(o.new_type);
+        if (arr(o.new_tags).length) changes.tags = [...new Set(arr(o.new_tags).map((x) => String(x).toLowerCase().trim()).filter(Boolean))];
+        if (arr(o.new_links).length) changes.links = arr(o.new_links).map((l) => ({ kind: l.kind, id: String(l.id) }));
+        if (!Object.keys(changes).length) return bad('an edit with no changed field');
+        const err = (changes.title !== undefined && (!changes.title.trim() || changes.title.length > 200) ? `title must be 1-200 chars (got ${changes.title.length})` : '')
+          || (changes.content !== undefined && (!changes.content.trim() || changes.content.length > 2000) ? `content must be 1-2000 chars (got ${changes.content.length})` : '')
+          || (changes.memory_type !== undefined && !MEMORY_TYPES.includes(changes.memory_type) ? `memory_type must be one of ${MEMORY_TYPES.join('/')}` : '')
+          || (changes.tags ? validTags(changes.tags) : '') || (changes.links ? validLinks(changes.links, t) : '');
+        if (err) return bad(err);
+        touched.add(t.id);
+        ops.push({ k, target: t.id, op: 'edit', changes, reason: str(o.reason, 600), evidence: str(o.evidence, 1200) });
+        return;
+      }
+      if (o.op === 'promote') {
+        if (t.promoted) return bad('already promoted to a Scroll');
+        touched.add(t.id);
+        ops.push({ k, target: t.id, op: 'promote', reason: str(o.reason, 600), evidence: str(o.evidence, 1200) });
+        return;
+      }
+      if (o.op === 'supersede' || o.op === 'duplicate_of') {
+        const other = o.op === 'duplicate_of' ? index.get(String(o.dup_of)) : null;
+        if (o.op === 'duplicate_of' && (!other || jur[other.id] !== 'T' || other.id === t.id)) return bad('dup_of is not another in-jurisdiction Imprint');
+        if (o.op === 'duplicate_of' && touched.has(other.id)) return bad('dup_of already has an op');
+        const combined = o.op === 'duplicate_of' && !!str(o.new_content).trim();
+        if (o.op === 'supersede' || combined) {
+          const into = o.op === 'supersede' ? t : other; // a combined duplicate supersedes dup_of and banishes target
+          const repl = replacementShape(o, into);
+          const err = validateImprintText(o.new_title, o.new_content, o.new_type || into.memory_type);
+          if (err) return bad(err);
+          if (!scopeOk(into, repl)) return bad(`replacement scope ${repl.scope} would move ${into.scope} Imprint ${into.id.slice(0, 8)} sideways`);
+          if (o.op === 'duplicate_of' && !scopeOk(t, repl)) return bad(`merged replacement scope ${repl.scope}${repl.project_id ? ' ' + repl.project_id.slice(0, 8) : ''} does not cover ${t.id.slice(0, 8)} (${t.scope}) — a merge must be ≥ both`);
+          if (repl.scope === 'org' && repl.project_id) return bad('an org Imprint carries no project_id');
+          if (repl.scope === 'project' && !HAUNTINGS.has(repl.project_id) && repl.project_id !== into.project_id) return bad('project replacement names a Haunting outside the scope');
+          touched.add(t.id);
+          if (other) touched.add(other.id);
+          ops.push({ k, target: into.id, op: 'supersede', also_banish: o.op === 'duplicate_of' ? t.id : '', scope: repl.scope, project_id: repl.project_id, title: String(o.new_title), content: String(o.new_content), memory_type: o.new_type || into.memory_type, reason: str(o.reason, 600), evidence: str(o.evidence, 1200) });
+          return;
+        }
+        // Pure duplicate: the target is contained in dup_of — banish the target, keep dup_of. dup_of is
+        // now load-bearing (it carries both), so it is reserved: no later op may rewrite or retire it.
+        touched.add(t.id);
+        touched.add(other.id);
+        ops.push({ k, target: t.id, op: 'banish', dup_of: other.id, reason: str(o.reason, 600), evidence: str(o.evidence, 1200) });
+        return;
+      }
+      return bad(`unknown op ${str(o.op, 20)}`);
+    });
+    for (const m of x.ms) if (!got.has(m.id)) invalid.push({ target: m.id, why: 'the checker returned no op for it (left untouched)' });
+  }
+
+  // 4. Refute. Destructive ops need their FULL quorum upholding: a banish 2 votes, the banish half of
+  //    a merge 2 votes, and every replacement text 1 accuracy vote. A lost vote means NOT applied.
+  phase('verify');
+  const tasks = [];
+  for (const o of ops) {
+    const text = () => `[${o.k}] ${o.op}${o.also_banish ? ` (merge: supersede ${o.target.slice(0, 8)}, banish ${o.also_banish.slice(0, 8)})` : ''} Imprint ${o.target}${o.dup_of ? ` (duplicate of ${o.dup_of})` : ''}\n  reason: ${o.reason}\n  evidence: ${o.evidence}${o.op === 'supersede' ? `\n  proposed replacement (${o.memory_type}, ${o.scope}): "${o.title}" — ${o.content}` : ''}${o.op === 'edit' ? `\n  proposed edit: ${JSON.stringify(o.changes).slice(0, 2500)}` : ''}`;
+    if (o.op === 'banish' || o.also_banish) for (const slot of [0, 1]) tasks.push({ id: o.k, lens: 'banish', slot, text });
+    if (o.op === 'supersede' || o.op === 'edit') tasks.push({ id: o.k, lens: 'accuracy', slot: 0, text });
+    if (o.op === 'promote') tasks.push({ id: o.k, lens: 'promote', slot: 0, text });
+  }
+  const LENS = {
+    banish: `Removing an Imprint is destructive: agents stop recalling it. holds=true ONLY if you confirm, in the pinned code, that the Imprint (full text in ${FILE}) is false or obsolete — or, for a duplicate, that the other Imprint says everything it says. holds=false if it is still true or still useful.`,
+    accuracy: `Check the proposed REPLACEMENT or EDIT against the pinned code: holds=true only if every statement it would make is true now (citations resolve, links point at what it is about) AND the old version really is stale or worse. holds=false if it is wrong, loses something true, or is a recommendation rather than a fact.`,
+    promote: `An Imprint is proposed for PROMOTION to a Scroll (it stays an Imprint too). holds=true only if it is a long procedure or reference a reader needs as a document, and it is still true; holds=false if it is a short fact that belongs only in recall.`,
+  };
+  const lensPrompt = (lens, items, retry) => `${retry ? 'You are an independent second reader checking proposed changes to an engineering memory store.' : 'You are an ADVERSARIAL VERIFIER of proposed changes to an engineering memory store.'}
+${TREE_RULES.split('\n').slice(0, 4).join('\n')}
+${LENS[lens]}
+Return one verdict per id.
+ITEMS:
+${items.map((t) => t.text(retry)).join('\n\n')}`;
+  const votes = await refute(tasks, lensPrompt, 'imprints');
+  for (const o of ops) {
+    const vs = votes.get(o.k) || [];
+    const need = (o.op === 'banish' || o.also_banish ? 2 : 0) + (['supersede', 'edit', 'promote'].includes(o.op) ? 1 : 0);
+    const live = vs.filter((x) => x.v);
+    o.status = live.length < need ? 'unverified' : live.every((x) => x.v.holds) ? 'pass' : 'refuted';
+  }
+  const passed = ops.filter((o) => o.status === 'pass');
+  log(`imprints: ${ops.length} op(s) proposed, ${passed.length} passed, ${ops.filter((o) => o.status === 'refuted').length} refuted, ${ops.filter((o) => o.status === 'unverified').length} unverified (not applied), ${invalid.length} invalid`);
+
+  const sealed = await seal('imprints', {
+    part: 'imprints',
+    posture: POSTURE,
+    legend: { T: 'this repo', O: 'another repo (untouched)', P: 'process (untouched)', '?': 'unclassified (untouched)' },
+    note: 'ops[].k is <check key>.<index into that stub\'s ops[]>; each op carries the exact replacement the engine validated. Only status "pass" is ever applied.',
+    jurisdiction: jur,
+    checks: checkSeal,
+    // The replacement text is sealed exactly as the engine validated it — apply writes THIS, not whatever
+    // the checker's stub file says, so what the Hunter approves is what reaches the API.
+    ops: ops.map((o) => ({ k: o.k, target: o.target, op: o.op, also_banish: o.also_banish || '', dup_of: o.dup_of || '', scope: o.scope || '', project_id: o.project_id || '', title: o.title || '', content: o.content || '', memory_type: o.memory_type || '', ...(o.changes ? { changes: o.changes } : {}), reason: o.reason, status: o.status })),
+    invalid,
+  });
+  return finish('complete', {
+    seal: { path: sealed.path, djb2: sealed.djb2, chars: sealed.chars },
+    seal_content: sealed.content,
+    counts: { imprints: index.size, in_jurisdiction: inJur.length, proposed: ops.length, passed: passed.length, edit: passed.filter((o) => o.op === 'edit').length, supersede: passed.filter((o) => o.op === 'supersede').length, banish: passed.filter((o) => o.op === 'banish').length + passed.filter((o) => o.also_banish).length, promote: passed.filter((o) => o.op === 'promote').length, invalid: invalid.length },
+  });
+}
+
+// ════════════════════════════════════════════════════════════════════════════════════════════
+// PART: verdict — cluster across Parts, dedupe, judge, cap, write the Scroll, seal the plan
+// ════════════════════════════════════════════════════════════════════════════════════════════
+const KINDS = ['theme', 'claim_gap', 'false_green', 'open_done', 'open_obsolete', 'misses_point', 'disputed', 'loose_end', 'imprint'];
+const DISPOSITIONS = ['file_ghost', 'fix_batch', 'enrich_existing', 'raise_augury', 'reopen_ghost', 'close_done', 'mark_obsolete', 'note_only', 'drop'];
+const STATUS_CHANGES = ['reopen_ghost', 'close_done', 'mark_obsolete'];
+const CANDIDATES = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    candidates: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          k: { type: 'string' },
+          kind: { type: 'string', enum: KINDS },
+          title: { type: 'string' },
+          severity: { type: 'string', enum: ['blocker', 'major', 'minor'] },
+          effort: { type: 'string', enum: ['small', 'medium', 'large'] },
+          summary: { type: 'string' },
+          sources: { type: 'array', items: { type: 'string' } },
+          ghost_ids: { type: 'array', items: { type: 'string' } },
+        },
+        required: ['k', 'kind', 'title', 'severity', 'effort', 'summary', 'sources', 'ghost_ids'],
+      },
+    },
+    stub_sha: { type: 'string' },
+  },
+  required: ['candidates', 'stub_sha'],
+};
+const MATCHES = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    matches: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        properties: { k: { type: 'string' }, ghost_id: { type: 'string' }, relation: { type: 'string', enum: ['duplicate', 'related', 'none'] }, evidence: { type: 'string' } },
+        required: ['k', 'relation', 'evidence'],
+      },
+    },
+  },
+  required: ['matches'],
+};
+const ACTIONS = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    actions: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          k: { type: 'string' },
+          disposition: { type: 'string', enum: DISPOSITIONS },
+          evidence_strength: { type: 'integer', minimum: 0, maximum: 3 },
+          target_ghost_id: { type: 'string' },
+          why: { type: 'string' },
+          draft: { type: 'object' },
+        },
+        required: ['k', 'disposition', 'evidence_strength', 'why', 'draft'],
+      },
+    },
+    stub_sha: { type: 'string' },
+  },
+  required: ['actions', 'stub_sha'],
+};
+const NEW_IMPRINTS = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    items: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          title: { type: 'string' },
+          content: { type: 'string' },
+          memory_type: { type: 'string' },
+          scope: { type: 'string', enum: ['org', 'project'] },
+          project_id: { type: 'string' },
+          tags: { type: 'array', items: { type: 'string' } },
+          source: { type: 'string' },
+        },
+        required: ['title', 'content', 'memory_type', 'scope', 'source'],
+      },
+    },
+    stub_sha: { type: 'string' },
+  },
+  required: ['items', 'stub_sha'],
+};
+const RECHECK = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    themes: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        properties: { title: { type: 'string' }, status: { type: 'string', enum: ['fixed', 'persisting', 'not_rechecked'] }, evidence: { type: 'string' } },
+        required: ['title', 'status', 'evidence'],
+      },
+    },
+  },
+  required: ['themes'],
+};
+const WRITTEN = {
+  type: 'object',
+  additionalProperties: false,
+  properties: { stub_sha: { type: 'string' }, scroll_chars: { type: 'integer' }, appendix_chars: { type: 'integer' } },
+  required: ['stub_sha', 'scroll_chars', 'appendix_chars'],
+};
+
+async function runVerdict() {
+  const seals = A.seals && typeof A.seals === 'object' ? A.seals : {};
+  const sealList = [].concat(seals.imprints ? [seals.imprints] : [], arr(seals.fidelity), arr(seals.health)).map(String);
+  if (!sealList.length) throw new Error('reckoning verdict: args.seals names no Part seals — run at least one Part first');
+  const BACKLOG_FILE = `${SNAP}/backlog.json`;
+  const backlog = new Map(arr(A.backlog).map((g) => [String(g.id), String(g.status || '')]));
+  const imprintTitles = new Set(arr(A.imprint_titles).map((t) => String(t).trim().toLowerCase()));
+  const HAUNTINGS = new Set(arr(A.hauntings_in_scope).map(String));
+  const HAUNTING_NAMES = arr(A.hauntings).filter((h) => h && h.id).map((h) => ({ id: String(h.id), name: str(h.name, 120) }));
+  // A candidate's tenets come from the EVIDENCE: the tenet ids its sourced findings and themes cite
+  // (prep reads them from the finders' stubs), never from the cluster's own say-so.
+  const TENETS_BY_REF = A.tenets_by_ref && typeof A.tenets_by_ref === 'object' ? A.tenets_by_ref : {};
+  const HAS_REFS = Object.keys(TENETS_BY_REF).length > 0;
+  const tenetsOf = (k, sources) => {
+    const out = new Set();
+    for (const src of arr(sources).map(String)) {
+      for (const m of src.matchAll(/([a-z0-9-]+):(F\d{3}\.\d+|warden\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+#[A-Za-z0-9_.-]+)/g)) {
+        const ref = `${m[1]}:${m[2]}`;
+        if (HAS_REFS && !(ref in TENETS_BY_REF)) { cap('source-unresolved', `${k} cites ${str(ref, 120)}, which no health seal holds — its tenets (if any) are not counted`); continue; }
+        for (const t of arr(TENETS_BY_REF[ref]).map(String)) if (TENET_IDS.includes(t)) out.add(t);
+      }
+    }
+    return [...out].sort();
+  };
+  phase('verdict');
+
+  const SOURCES = `PART SEALS (each is a JSON map of the engine's decisions, with a "legend" and "note" explaining it; the stubs it names sit in the same directory):
+${sealList.map((s) => `- ${s}`).join('\n')}
+INSTRUMENTS: ${INSTR}/*.json (loose-ends.json lists stuck Rites, merged-but-in-review ghosts, parked invocations, stale worktrees and branches).
+BACKLOG SNAPSHOT (every ghost of this repo, all statuses): ${BACKLOG_FILE}`;
+
+  // 1. Cluster across Parts into action candidates.
+  const cl = await tryAgent(
+    'cluster',
+    `${TREE_RULES}
+
+${SOURCES}
+
+You turn a finished audit into ACTION CANDIDATES. Read every seal and the stubs it names. Make ONE candidate per distinct problem, across Parts — a fidelity "partial" and a health theme about the same defect are ONE candidate citing both sources. Kinds:
+- theme — a verified health theme (source = its warden key + theme key);
+- claim_gap — delivered work that is missing / partial / regressed / divergent (verified, not flagged);
+- false_green — an exorcised ghost whose claims are not actually delivered (from the fidelity units' false_greens);
+- open_done / open_obsolete — an open ghost the code shows is already done / made obsolete (verified, not flagged);
+- misses_point — built as written but not serving the confirmed intent (also every unit warden question);
+- disputed — a delivered claim a skeptic disputed;
+- loose_end — from loose-ends.json;
+- imprint — a passed Imprint op worth mentioning (the ops themselves are applied separately; do not duplicate them).
+Only VERIFIED material: skip refuted (r), deliberate (d), negligible (x) and invalid statuses. Flagged items (lowercase) may become candidates but say "flagged" in the summary.
+k = a short stable key (c01, c02, …); sources = the seal/stub references (e.g. "health-backend:warden.backend.runtime#t3", "fidelity:B007.2"); ghost_ids = every ghost the candidate is about (exact ids from the stubs/snapshot).
+${commitInstr('cluster', 'your result {candidates}')}`,
+    { label: 'cluster', phase: 'verdict', schema: CANDIDATES, effort: 'xhigh', ...M('cluster'), ...asLeaf, ...STALL_OPT },
+    hasSha,
+  );
+  if (!cl) return finish('aborted', { reason: 'the cluster stage died — no action candidates; re-run the verdict Part' });
+  const candidates = [];
+  const seenK = new Set();
+  for (const c of arr(cl.candidates)) {
+    const k = str(c.k, 20);
+    if (!k || seenK.has(k)) { cap('candidate-invalid', `duplicate or empty key ${k}`); continue; }
+    seenK.add(k);
+    const ghostIds = arr(c.ghost_ids).map(String).filter((g) => {
+      if (backlog.has(g)) return true;
+      cap('candidate-unknown-ghost', `${k} names ghost ${str(g, 40)}, which is not in the backlog snapshot — dropped from the candidate`);
+      return false;
+    });
+    candidates.push({ k, kind: KINDS.includes(c.kind) ? c.kind : 'theme', title: str(c.title, 200), severity: SEV[c.severity] ? c.severity : 'minor', effort: c.effort || 'medium', summary: str(c.summary, 1500), ghost_ids: ghostIds, tenets: tenetsOf(k, c.sources) });
+  }
+  log(`verdict: ${candidates.length} action candidate(s)`);
+
+  // 2. Backlog dedupe (from the snapshot — leaves never call the API).
+  const dd = await all(
+    chunk(candidates, 6).map((cs, bi) => async () => {
+      const key = `dedupe.${pad(bi + 1)}`;
+      const r = await tryAgent(
+        key,
+        `The backlog below is scarce: before anything is filed, find whether it already exists. For each candidate, search ${BACKLOG_FILE} (titles, descriptions, context payloads AND Wisps of related ghosts — the thing about to be filed is often already a subtask of something open). relation = duplicate (the same work), related (overlapping — an EVP there beats a new ghost), or none. ghost_id = the exact existing ghost id when not none.
+CANDIDATES:
+${cs.map((c) => `[${c.k}] (${c.kind}, ${c.severity}) ${c.title} — ${str(c.summary, 400)}`).join('\n')}`,
+        { label: key, phase: 'verdict', schema: MATCHES, effort: 'high', ...M('dedupe') },
+        (x) => Array.isArray(x.matches),
+      );
+      return r;
+    }),
+  );
+  const matchOf = new Map();
+  for (const r of dd.filter(Boolean)) for (const m of arr(r.matches)) {
+    if (m.relation !== 'none' && !backlog.has(String(m.ghost_id || ''))) { cap('dedupe-unknown-ghost', `${str(m.k, 20)} matched ${str(m.ghost_id, 40)}, not in the backlog — ignored`); continue; }
+    matchOf.set(String(m.k), { relation: m.relation, ghost_id: m.relation === 'none' ? '' : String(m.ghost_id), evidence: str(m.evidence, 400) });
+  }
+  const undeduped = candidates.filter((c) => !matchOf.has(c.k)).length;
+  if (undeduped) cap('dedupe-missing', `${undeduped} candidate(s) got no backlog check (a dedupe agent died) — the judge is told to prefer enriching over filing for them`);
+
+  // 3. Judge: the ruthless filing bars. Drafts go to the judge's stub; the engine owns the caps.
+  const judge = await tryAgent(
+    'judge',
+    `${TREE_RULES}
+
+You decide what happens to each action candidate. Read the repo's CLAUDE.md in the pinned tree — its "Filing New Ghosts — Be Ruthlessly Discerning" rules are binding: the backlog is scarce; a ghost must be (1) verified, not inferred, (2) something someone would actually prioritize, (3) too big to just do now. Default to NOT filing.
+Dispositions:
+- file_ghost — clears all three bars, and nothing in the backlog covers it. Draft: title, priority (whisper/moan/scream/banshee), description, context_payload {objective, acceptance_criteria[], files[], instructions[]}.
+- fix_batch — small (a few lines), verified, worth doing now: ALL of these become ONE cleanup ghost with a checklist, executable by /commence-haunt. Draft: its checklist line and the files.
+- enrich_existing — the backlog already has it (duplicate or related): draft the EVP to post there, with the new evidence.
+- raise_augury — a genuine fork a Hunter must decide. Every misses_point candidate is an Augury question, NEVER a ghost. Draft: title, context, options.
+- reopen_ghost — an exorcised ghost that is not actually delivered: draft the EVP stating the evidence.
+- close_done — an open ghost the code shows is already done: draft the EVP with the evidence (it is then exorcised).
+- mark_obsolete — an open ghost the product moved past: draft the EVP (it gets an "obsolete" Sigil; it is NEVER exorcised).
+- note_only — recorded in the Scroll, no action. drop — not worth recording (say why).
+TENET VIOLATIONS (a candidate marked TENETS below, major or worse): the Hunter wrote these tenets as this repo's own rules, so bar (2) is already met — "nobody feels it at today's scale" is NOT a reason to leave one as note_only. Bars (1) and (3) still apply: small → fix_batch; bigger → file_ghost; an existing ghost covers it → enrich_existing. note_only or drop only when another action in this plan already covers it (name its key in why) or a documented exception covers it (cite it). The 7-ghost cap still applies, by severity then evidence.
+evidence_strength: 3 = measured or reproduced; 2 = verified by code reading with a quorum; 1 = flagged / partially verified; 0 = inferred.
+target_ghost_id is required for enrich_existing / reopen_ghost / close_done / mark_obsolete (an exact id from the backlog snapshot).
+HAUNTINGS a new ghost may be filed in: ${HAUNTING_NAMES.map((h) => `${h.id} "${h.name}"`).join('; ') || '(the scope\'s Hauntings, from the backlog snapshot)'}.
+CANDIDATES (with the backlog check):
+${candidates.map((c) => { const m = matchOf.get(c.k); return `[${c.k}] ${c.kind} · ${c.severity} · effort ${c.effort} · ghosts ${c.ghost_ids.join(',') || '-'}${m ? ` · backlog: ${m.relation}${m.ghost_id ? ' ' + m.ghost_id : ''}` : ' · backlog: NOT CHECKED'}${c.tenets.length && SEV[c.severity] >= SEV.major ? ` · TENETS: ${c.tenets.join(', ')}` : ''}\n  ${c.title}\n  ${c.summary}`; }).join('\n')}
+Your stub must hold, per candidate, {k, disposition, evidence_strength, target_ghost_id, why, draft}, where draft has EXACTLY this shape for its disposition (a script applies it; anything else is skipped):
+- file_ghost: {"project_id": "<one of the Haunting ids above>", "title": "…", "priority": "whisper|moan|scream|banshee", "description": "… (≤5000 chars)", "context_payload": {"objective": "…", "acceptance_criteria": ["…"], "files": ["path"], "instructions": ["…"]}}
+- fix_batch: {"item": "one checklist line: what to change, where", "files": ["path"]}
+- enrich_existing / reopen_ghost / close_done / mark_obsolete: {"evp": "the markdown EVP to post, with the evidence (path:line)"}
+- raise_augury: {"title": "the question", "context": "markdown ≤20000 chars", "options": [{"key": "a", "label": "…", "description": "…"}], "task_id": "<ghost id, optional>"}
+- note_only / drop: {}
+${commitInstr('judge', 'your result {actions}, each action also carrying its draft')}`,
+    { label: 'judge', phase: 'verdict', schema: ACTIONS, effort: 'xhigh', ...M('judge'), ...asLeaf, ...STALL_OPT },
+    hasSha,
+  );
+  if (!judge) return finish('aborted', { reason: 'the judge stage died — no action plan; re-run the verdict Part' });
+
+  // Engine-owned rules and caps. Sorted by severity, then evidence strength, then key — never by the
+  // order an agent happened to list things — so what gets demoted is reproducible.
+  //
+  // STATE CHANGES NEED VERIFIED GROUNDS. A reopen, close or obsolete is only allowed against the
+  // fidelity seals' VERIFIED sets (the skill reads them into args.verified): a false green for a
+  // reopen, a quorum-backed "already done" (or a loose end with a merged PR) for a close, a
+  // quorum-backed "obsolete" for the Sigil. A lone skeptic dispute or a judge's hunch is a question,
+  // not a state change.
+  const V = A.verified && typeof A.verified === 'object' ? A.verified : {};
+  const setOf = (xs) => new Set(arr(xs).map(String));
+  const GROUNDS = { reopen_ghost: setOf(V.false_greens), close_done: new Set([...setOf(V.open_done), ...setOf(V.loose_close)]), mark_obsolete: setOf(V.open_obsolete) };
+  const FILE_HAUNTINGS = new Set(HAUNTING_NAMES.length ? HAUNTING_NAMES.map((h) => h.id) : [...HAUNTINGS]);
+  const PRIORITIES = ['whisper', 'moan', 'scream', 'banshee'];
+  // Each draft is validated against the API limits it will meet, so a plan the Hunter approves is a
+  // plan that applies — and the sealed plan carries the draft exactly as validated here.
+  const validDraft = (d, draft, c) => {
+    const x = draft && typeof draft === 'object' ? draft : {};
+    const t = (v, n) => (typeof v === 'string' ? v.trim().slice(0, n) : '');
+    if (d === 'file_ghost') {
+      if (!FILE_HAUNTINGS.has(String(x.project_id || ''))) return { err: `file_ghost draft names Haunting ${str(x.project_id, 40) || '(none)'} outside the scope` };
+      if (!t(x.title, 500)) return { err: 'file_ghost draft has no title' };
+      const cp = x.context_payload && typeof x.context_payload === 'object' ? x.context_payload : {};
+      return { draft: { project_id: String(x.project_id), title: t(x.title, 500), priority: PRIORITIES.includes(x.priority) ? x.priority : 'moan', description: t(x.description, 5000), context_payload: { objective: t(cp.objective, 2000) || t(c.summary, 2000), acceptance_criteria: arr(cp.acceptance_criteria).map((v) => t(String(v), 500)).filter(Boolean).slice(0, 20), files: arr(cp.files).map((v) => t(String(v), 300)).filter(Boolean).slice(0, 50), instructions: arr(cp.instructions).map((v) => t(String(v), 800)).filter(Boolean).slice(0, 20) } } };
+    }
+    if (d === 'fix_batch') return t(x.item, 600) ? { draft: { item: t(x.item, 600), files: arr(x.files).map((v) => t(String(v), 300)).filter(Boolean).slice(0, 20) } } : { err: 'fix_batch draft has no checklist item' };
+    if (['enrich_existing', ...STATUS_CHANGES].includes(d)) return t(x.evp, 9500) ? { draft: { evp: t(x.evp, 9500) } } : { err: `${d} draft has no EVP text` };
+    if (d === 'raise_augury') {
+      if (!t(x.title, 500)) return { err: 'raise_augury draft has no title' };
+      const opts = arr(x.options).filter((o) => o && t(o.key, 64) && t(o.label, 200)).slice(0, 20).map((o) => ({ key: t(o.key, 64), label: t(o.label, 200), ...(t(o.description, 1000) ? { description: t(o.description, 1000) } : {}) }));
+      return { draft: { title: t(x.title, 500), context: t(x.context, 19500), ...(opts.length ? { options: opts } : {}), ...(backlog.has(String(x.task_id || '')) ? { task_id: String(x.task_id) } : {}) } };
+    }
+    return { draft: {} };
+  };
+  const byK = new Map(candidates.map((c) => [c.k, c]));
+  const actions = [];
+  for (const a of arr(judge.actions)) {
+    const c = byK.get(String(a.k));
+    if (!c) { cap('action-unknown', `judge returned an action for unknown candidate ${str(a.k, 20)}`); continue; }
+    if (actions.some((x) => x.k === c.k)) { cap('action-duplicate', `judge returned ${c.k} twice — the first is kept`); continue; }
+    let d = DISPOSITIONS.includes(a.disposition) ? a.disposition : 'note_only';
+    let target = String(a.target_ghost_id || '');
+    let draft = a.draft;
+    const why = [];
+    if (c.kind === 'misses_point' && !['raise_augury', 'note_only', 'drop'].includes(d)) {
+      if (c.severity === 'minor') {
+        // The judge wanted to just fix it: a minor one is not a question worth the Hunter's time. It is
+        // recorded in the Scroll, never forced into an Augury (the pilot's noise Augury on t() copy).
+        why.push(`a minor misses_point is recorded, not put to the Hunter (was ${d})`);
+        d = 'note_only';
+        draft = {};
+      } else {
+        why.push(`misses_point is only ever an Augury (was ${d})`);
+        d = 'raise_augury';
+        draft = { title: `Does "${str(c.title, 300)}" serve what it was for?`, context: c.summary, ...(c.ghost_ids.length === 1 ? { task_id: c.ghost_ids[0] } : {}) };
+      }
+    }
+    if (['enrich_existing', ...STATUS_CHANGES].includes(d)) {
+      const st = backlog.get(target);
+      if (!st) { why.push(`${d} needs a backlog ghost id (got ${str(target, 40) || 'none'})`); d = 'note_only'; target = ''; }
+      else if (d === 'reopen_ghost' && st !== 'exorcised') { why.push(`reopen_ghost on a ${st} ghost`); d = 'note_only'; }
+      else if ((d === 'close_done' || d === 'mark_obsolete') && !OPEN_STATUSES.includes(st)) { why.push(`${d} on a ${st} ghost`); d = 'note_only'; }
+      else if (GROUNDS[d] && !GROUNDS[d].has(target)) { why.push(`${d} on ${target.slice(0, 8)} has no verified grounds (not in the fidelity seals' ${d === 'reopen_ghost' ? 'false greens' : d === 'close_done' ? 'already-done or merged-loose-end' : 'obsolete'} set)`); d = 'note_only'; }
+    }
+    let valid = { draft: {} };
+    if (!['note_only', 'drop'].includes(d)) {
+      valid = validDraft(d, draft, c);
+      if (valid.err) { why.push(valid.err); d = 'note_only'; valid = { draft: {} }; }
+    }
+    if (why.length) cap('action-coerced', `${c.k}: ${why.join('; ')}`);
+    actions.push({ k: c.k, kind: c.kind, title: c.title, severity: c.severity, tenets: c.tenets, evidence_strength: Number.isInteger(a.evidence_strength) ? a.evidence_strength : 0, disposition: d, target_ghost_id: target, why: str(a.why, 400), coerced: why.length ? str(why.join('; '), 400) : '', draft: valid.draft });
+  }
+  for (const c of candidates) if (!actions.some((a) => a.k === c.k)) { actions.push({ k: c.k, kind: c.kind, title: c.title, severity: c.severity, tenets: c.tenets, evidence_strength: 0, disposition: 'note_only', target_ghost_id: '', why: 'the judge returned no disposition', draft: {} }); cap('action-missing', `${c.k} got no disposition — note_only`); }
+  const order = (x, y) => sevRank(y.severity) - sevRank(x.severity) || y.evidence_strength - x.evidence_strength || (x.k < y.k ? -1 : x.k > y.k ? 1 : 0);
+  // One state change per ghost: two actions reopening and closing the same ghost cannot both apply.
+  const byTarget = new Map();
+  for (const a of actions.filter((x) => STATUS_CHANGES.includes(x.disposition)).sort(order)) {
+    if (byTarget.has(a.target_ghost_id)) { cap('status-change-conflict', `${a.k} ${a.disposition} on ${a.target_ghost_id.slice(0, 8)} dropped — ${byTarget.get(a.target_ghost_id)} already changes that ghost`); a.demoted_from = a.disposition; a.demote_reason = `${byTarget.get(a.target_ghost_id)} already changes that ghost`; a.disposition = 'note_only'; }
+    else byTarget.set(a.target_ghost_id, `${a.k} ${a.disposition}`);
+  }
+  const capTo = (filter, n, label) => {
+    const xs = actions.filter(filter).sort(order);
+    xs.slice(n).forEach((a) => { cap(label, `${a.k} "${str(a.title, 80)}" ${a.disposition} → note_only (over the cap of ${n})`); a.demoted_from = a.disposition; a.demote_reason = `over the ${label} of ${n}`; a.disposition = 'note_only'; });
+  };
+  capTo((a) => a.disposition === 'file_ghost', LIM.new_ghosts, 'new-ghost-cap');
+  capTo((a) => STATUS_CHANGES.includes(a.disposition), LIM.status_changes, 'status-change-cap');
+  capTo((a) => a.disposition === 'enrich_existing', LIM.evps, 'evp-cap');
+  // A verified major-or-worse violation of the Hunter's own tenets that still ends as a note is never
+  // silent: each one is capped here and listed in the Scroll with the reason it was not filed.
+  const tenetNoted = actions.filter((a) => arr(a.tenets).length && SEV[a.severity] >= SEV.major && ['note_only', 'drop'].includes(a.disposition));
+  // The reason it is NOT filed: a demotion or an engine refusal outranks the judge's own text (which,
+  // for a refused enrich or ghost, argues FOR filing it).
+  const notFiledWhy = (a) => (a.demoted_from ? `demoted from ${a.demoted_from}: ${a.demote_reason || 'a cap'}` : a.coerced ? `the judge chose it, the engine refused it: ${a.coerced}` : str(a.why, 200));
+  for (const a of tenetNoted) cap('tenet-not-filed', `${a.k} (${a.severity}; ${a.tenets.join(', ')}) stays ${a.disposition} — ${notFiledWhy(a)}`);
+  const fixBatch = actions.filter((a) => a.disposition === 'fix_batch').sort(order).map((a) => a.k);
+
+  // 4. New Imprint candidates — facts only, engine-capped at LIM.new_imprints. Never one that describes
+  //    something this same plan FIXES: it would go false the day the fix lands.
+  const fixedHere = new Set(actions.filter((a) => ['fix_batch', 'file_ghost'].includes(a.disposition)).map((a) => a.k));
+  const candList = actions.filter((a) => a.disposition !== 'drop').map((a) => `${a.k} · ${a.disposition} · ${str(a.title, 160)}`).join('\n');
+  const ni = await tryAgent(
+    'new-imprints',
+    `${TREE_RULES}
+
+${SOURCES}
+
+Propose at most ${LIM.new_imprints + 3} NEW Imprints from this audit's VERIFIED material: mechanism-grade gotchas or conventions an implementer needs at the START of a task in this codebase (name the file / function / identifier). NEVER an audit statistic ("12 routers call commit" is not an Imprint), never a recommendation or a decision (the "should/could/recommend" test), and never something an existing Imprint in ${SNAP}/imprints.json already says. memory_type one of ${MEMORY_TYPES.join('/')}; title ≤200 chars; content ≤2000 chars; scope "project" (with project_id = one of ${[...HAUNTINGS].join(', ') || 'the in-scope Hauntings'}) or "org" (no project_id) when it holds across Hauntings.
+Each item's "source" names the action candidate key(s) it comes from (e.g. "${actions[0] ? actions[0].k : 'c01'}"), or "none" for a verified fact no candidate carries. NEVER propose an Imprint about something this plan FIXES (a candidate below marked fix_batch or file_ghost): it goes false the day the fix lands, and the engine drops it.
+ACTION CANDIDATES (key · disposition · title):
+${candList || '(none)'}
+Models miscount, so MEASURE: after writing your draft, run  bash "${BUS_SCRIPT}" lint-imprints "${BUS}/.tmp/new-imprints.json"  and fix whatever it reports until it prints ok:true — then commit.
+${commitInstr('new-imprints', 'your result {items}')}`,
+    { label: 'new-imprints', phase: 'verdict', schema: NEW_IMPRINTS, effort: 'high', ...M('new_imprints'), ...asLeaf },
+    hasSha,
+  );
+  const newImprints = [];
+  arr(ni && ni.items).forEach((m, i) => {
+    const err = validateImprintText(m.title, m.content, m.memory_type)
+      || (m.scope === 'org' && m.project_id ? 'an org Imprint carries no project_id' : '')
+      || (m.scope === 'project' && !HAUNTINGS.has(String(m.project_id || '')) ? 'project Imprint must name an in-scope Haunting' : '')
+      || (imprintTitles.has(String(m.title).trim().toLowerCase()) ? 'an Imprint with this title already exists' : '');
+    if (err) { cap('new-imprint-invalid', `new-imprints[${i}]: ${err}`); return; }
+    const fixing = String(m.source || '').split(/[^A-Za-z0-9_.-]+/).filter((t) => fixedHere.has(t));
+    if (fixing.length) { cap('new-imprint-fixed-by-plan', `new-imprints[${i}] "${str(m.title, 60)}" describes ${[...new Set(fixing)].join(', ')}, which this plan fixes — it would go false when the fix lands`); return; }
+    if (newImprints.length >= LIM.new_imprints) { cap('new-imprint-cap', `new-imprints[${i}] "${str(m.title, 60)}" over the cap of ${LIM.new_imprints}`); return; }
+    newImprints.push({ i, title: String(m.title).trim(), content: String(m.content).trim(), memory_type: m.memory_type, scope: m.scope, ...(m.scope === 'project' ? { project_id: String(m.project_id) } : {}), tags: [...new Set(arr(m.tags).map((x) => String(x).toLowerCase().trim().slice(0, 50)).filter(Boolean))].slice(0, 19) });
+  });
+
+  // 5. Re-check the previous reckoning's themes against THIS tree (evidence required).
+  let recheck = null;
+  if (A.previous_scroll) {
+    recheck = await tryAgent(
+      'recheck',
+      `${TREE_RULES}
+
+The previous reckoning's Scroll is at ${String(A.previous_scroll)}. For each of its systemic themes, check the pinned code NOW: fixed (cite what changed), persisting (cite where it still is), or not_rechecked (you could not tell — say why). Evidence is required for fixed and persisting; a theme simply not re-found is not_rechecked, never fixed.`,
+      { label: 'recheck', phase: 'verdict', schema: RECHECK, effort: 'high', ...M('recheck') },
+      (x) => Array.isArray(x.themes),
+    );
+    if (!recheck) cap('recheck-dead', 'the previous themes were not re-checked');
+  }
+
+  // 6. The Arbiter writes the Scroll and its appendix.
+  const planLines = actions
+    .filter((a) => a.disposition !== 'drop')
+    .sort(order)
+    .map((a) => `${a.k} · ${a.disposition}${a.demoted_from ? ` (demoted from ${a.demoted_from})` : ''} · ${a.severity} · ${a.kind}${a.target_ghost_id ? ` · ghost ${a.target_ghost_id}` : ''} · ${a.title}`);
+  const art = await tryAgent(
+    'arbiter',
+    `${TREE_RULES}
+
+${SOURCES}
+
+You are the ARBITER. Write the Reckoning Scroll (markdown) for a time-poor owner who reads it once to decide. Scope: ${SCOPE.kind}${SCOPE.name ? ` "${SCOPE.name}"` : ''}. ${REASON ? `The reckoning's stated reason, which your verdict answers FIRST: "${REASON}".` : ''}
+WHAT WAS REVIEWED — say it plainly under the verdict: ${(() => { const c = A.coverage || {}; const f = c.footprint; return `${c.scoped ? `only this scope's code — ${f ? `${f.touched} touched file(s) + ${f.adjacent} adjacent, from ${f.ghosts_with_footprint}/${f.ghosts} ghosts with a code footprint` : 'its footprint'}` : 'the whole codebase'}; claims checked for ${c.history && c.history !== 'all' ? `the "${c.history}" history window only` : 'every in-scope ghost'}${c.out_of_jurisdiction ? `; ${c.out_of_jurisdiction} ghost(s) excluded as another repo's work` : ''}`; })()}.${arr(A.missing_parts).length ? `
+PARTS THAT DID NOT RUN (the Hunter accepted a verdict without them): ${arr(A.missing_parts).map(String).join(', ')}. Say so in the verdict's first paragraph — this reckoning does NOT cover them, and nothing here is a clean bill of health for that code.` : ''}
+Main Scroll, in THIS order, at most ${LIM.scroll_bytes} characters:
+1. Verdict + decisions needed (one paragraph, then the decisions as a short list).
+2. Action plan — the FINAL plan below, grouped by disposition. Link every ghost as /ghosts/<uuid> and every Augury as /decisions/<uuid> (these become backlinks). The fix_batch items are ONE ghost's checklist.
+3. Per Rite / Haunting, worst first — use each fidelity unit's engine numbers VERBATIM ("platform says X/Y exorcised; code confirms A; B false greens; N open already done") plus its intent verdict, what misses the point (as questions), what remains.
+4. Loose ends.
+5. Principles scorecard — one table: each principle / tenet id, holds / strained / violated, its top sites (from the health seals' scorecards). Then the systemic themes (at most 10, grouped by principle).${tenetNoted.length ? ` Then "Tenet violations left as notes" — every one of these, with its tenets and the reason it was not filed: ${tenetNoted.map((a) => `${a.k} (${a.severity}; ${a.tenets.join(', ')}; ${str(notFiledWhy(a), 200)}) ${str(a.title, 120)}`).join(' | ')}.` : ''}
+6. Instruments — the key numbers${A.previous_instruments ? `, with the change since ${String(A.previous_instruments)}` : ''}.
+7. Imprint changes (the passed ops, and the new Imprints proposed).
+${recheck ? `8. The previous reckoning's themes: ${arr(recheck.themes).map((t) => `${str(t.title, 80)} = ${t.status}`).join('; ')}.` : ''}
+Appendix (a separate markdown file): the coverage matrix and caps below, verify stats, per-claim tables per Rite/Haunting, the note_only list, deliberate findings with their citations.
+FINAL PLAN (engine-capped — do not change dispositions):
+${planLines.join('\n') || '(no actions)'}
+FIX BATCH (one ghost): ${fixBatch.join(', ') || '(none)'}
+NEW IMPRINTS: ${newImprints.map((m) => `"${m.title}" (${m.memory_type}, ${m.scope})`).join('; ') || '(none)'}
+CAPS AND DEMOTIONS: ${CAPS.map((c) => `${c.kind}: ${c.detail}`).join(' | ').slice(0, 6000) || '(none)'}
+Write the Scroll to ${BUS}/.tmp/scroll-body.md, the appendix to ${BUS}/.tmp/appendix-body.md, and your stub {"scroll_chars": N, "appendix_chars": N} to ${BUS}/.tmp/scroll.json, then run EXACTLY (each commit moves its .md to ${BUS}/<key>.md):
+  bash "${BUS_SCRIPT}" commit "${BUS}" scroll "${BUS}/.tmp/scroll.json" "${BUS}/.tmp/scroll-body.md"
+  printf '{"of":"scroll"}' > "${BUS}/.tmp/appendix.json" && bash "${BUS_SCRIPT}" commit "${BUS}" appendix "${BUS}/.tmp/appendix.json" "${BUS}/.tmp/appendix-body.md"
+Return the scroll commit's stub_sha and both character counts.`,
+    { label: 'arbiter', phase: 'verdict', schema: WRITTEN, effort: 'xhigh', ...M('arbiter'), ...asLeaf, ...STALL_OPT },
+    hasSha,
+  );
+  if (!art) cap('arbiter-dead', 'no Scroll was written — the sealed plan is complete; re-run the verdict Part to write it');
+  else if (art.scroll_chars > LIM.scroll_bytes) cap('scroll-over-length', `the Scroll is ${art.scroll_chars} chars, over the ${LIM.scroll_bytes} cap`);
+
+  const plan = {
+    part: 'verdict',
+    scope: SCOPE,
+    reason: REASON,
+    note: 'Each action carries the draft EXACTLY as the engine validated it — apply writes these, never a stub file. note_only and drop are never applied.',
+    actions: actions.map((a) => ({ k: a.k, disposition: a.disposition, demoted_from: a.demoted_from || '', severity: a.severity, kind: a.kind, tenets: arr(a.tenets), target_ghost_id: a.target_ghost_id, title: a.title, draft: a.draft })),
+    fix_batch: fixBatch,
+    new_imprints: newImprints,
+    imprint_ops_seal: seals.imprints || '',
+    stubs: { cluster: cl.stub_sha, judge: judge.stub_sha, new_imprints: ni ? ni.stub_sha : null, scroll: art ? art.stub_sha : null },
+    recheck: recheck ? arr(recheck.themes).map((t) => ({ title: str(t.title, 200), status: t.status })) : null,
+  };
+  const sealed = await seal('plan', plan);
+  const byDisp = {};
+  for (const a of actions) byDisp[a.disposition] = (byDisp[a.disposition] || 0) + 1;
+  return finish('complete', {
+    seal: { path: sealed.path, djb2: sealed.djb2, chars: sealed.chars },
+    seal_content: sealed.content,
+    scroll: art ? { path: `${BUS}/scroll.md`, appendix: `${BUS}/appendix.md`, chars: art.scroll_chars } : null,
+    counts: { candidates: candidates.length, dispositions: byDisp, fix_batch: fixBatch.length, new_imprints: newImprints.length },
+  });
+}
+
+// ── dispatch ──
+{
+  const fable = Object.keys(ROLE_MODELS).filter((r) => M(r).model === pin('fable'));
+  const specific = Object.keys(ROLE_OVERRIDES).filter((k) => k.includes('.'));
+  log(`models: ${Object.keys(ROLE_MODELS).map((r) => `${r}=${M(r).model}`).join(' ')}${specific.length ? ` · lens overrides: ${specific.map((k) => `${k}=${ovr(k)}`).join(' ')}` : ''}`);
+  if (fable.length > 8) log(`models: WARNING — ${fable.length} roles on fable; the default puts only the synthesis roles there`);
+}
+log(`reckoning: part=${PART} depth=${DEPTH} scope=${SCOPE.kind}${SCOPE.name ? ` "${SCOPE.name}"` : ''} posture=${POSTURE} budget=${LIM.budget} tree=${TREE}`);
+if (PART === 'health') return await runHealth();
+if (PART === 'fidelity') return await runFidelity();
+if (PART === 'imprints') return await runImprints();
+return await runVerdict();

@@ -1,0 +1,20 @@
+{
+  "name": "ghost-kit",
+  "interface": {
+    "displayName": "Ghost Kit"
+  },
+  "plugins": [
+    {
+      "name": "ghost-hunting-core",
+      "source": {
+        "source": "local",
+        "path": "./plugins/ghost-hunting-core"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

@@ -1,0 +1,746 @@
+#!/usr/bin/env bash
+# ghost-kit — connect this computer and this repo to Ghost Hunting.
+#
+# bash 3.2 (macOS /bin/bash) + curl + jq only; no npm, no node. The /ghost-onboard skill drives it;
+# people can also run it themselves in a terminal. User-facing copy says /ghost-onboard.
+#
+#   ghost-kit login [--org-hint ID] [--local] [--api-base URL] [--no-browser]
+#                                   start a browser login and wait for it (a real terminal)
+#   ghost-kit login --start [...]   start (or resume) a login: prints ONLY the code and the URL
+#   ghost-kit login --wait [--timeout SECS]
+#                                   poll ~90s. Exit 0 connected | 10 still pending (call again)
+#                                   11 expired: a fresh code was started and printed | 2 denied
+#                                   12 cannot write ~/.config/ghost-hunting (sandbox) | 1 error
+#   ghost-kit status [--repo-root DIR] [--local] [--json] [--offline]
+#                                   Coven, Medium, key name, the file it came from, shadowing.
+#                                   Exit 0 ok | 3 no key | 4 key rejected | 5 wrong Coven
+#                                   6 unreachable | 1 other
+#   ghost-kit logout [--org-id ID] [--repo-root DIR]
+#   ghost-kit doctor [--tools] [--repo-root DIR]
+#   ghost-kit init --seance ID --org-id ID --org-name NAME [--seance-name N]
+#                  [--tests-frontend CMD] [--tests-backend CMD] [--tests-all CMD]
+#                  [--rites] [--force] [--dry-run] [--no-settings] [--repo-root DIR]
+#   ghost-kit covens [--json]       the Covens this computer is signed in to (one /me per key)
+#   ghost-kit api METHOD /api/agent/... [--org-id ID] [--data JSON]
+#                                   one Agent API call with the right key; the key is never shown
+#   ghost-kit update-hint           how to update ghost-kit on this computer (by marketplace type)
+#   ghost-kit version
+#
+# The API key (Talisman) is NEVER printed. It lands only in
+# ${XDG_CONFIG_HOME:-~/.config}/ghost-hunting/.env (dir 700, file 600) under
+# GHOST_HUNTING_API_KEY__<ORG8> — the first 8 hex chars of the Coven's id, uppercased — and no
+# other line of that file is touched. Never the bare GHOST_HUNTING_API_KEY: a bare name cannot
+# say which Coven its key belongs to.
+set -u
+
+GK_BIN="$0"
+PLUGIN_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+PROD_API="https://backend-production-ea01.up.railway.app"
+LOCAL_API="http://localhost:8000"
+MIRROR_URL="https://github.com/jweilbach/ghost-kit.git"
+INSTALL_ONE_LINER="curl -fsSL https://github.com/jweilbach/ghost-kit/releases/latest/download/install.sh | bash"
+CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/ghost-hunting"
+USER_ENV="$CONF_DIR/.env"
+PENDING="$CONF_DIR/pending-login.json"
+CLAUDE_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+UUID_RE='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+
+TMPFILES=""
+cleanup() { [ -n "$TMPFILES" ] && rm -f $TMPFILES; return 0; }
+trap cleanup EXIT
+mktmp() { local f; f=$(mktemp "${TMPDIR:-/tmp}/ghost-kit.XXXXXX") || return 1; TMPFILES="$TMPFILES $f"; printf '%s' "$f"; }
+
+say() { printf '%s\n' "$*"; }
+err() { printf 'ghost-kit: %s\n' "$*" >&2; }
+die() { err "$*"; exit 1; }
+need() { command -v "$1" >/dev/null 2>&1 || die "needs $1, which is not installed. $(install_hint "$1")"; }
+
+plugin_version() { sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$PLUGIN_ROOT/.claude-plugin/plugin.json" 2>/dev/null | head -n 1; }
+
+# ver_ge A B — 0 when version A >= B (numeric, dot-separated; bash 3.2 has no sort -V guarantee).
+ver_ge() {
+  local IFS=. i x y
+  local a=($1) b=($2)
+  for i in 0 1 2; do
+    x=${a[$i]:-0}; y=${b[$i]:-0}
+    x=${x%%[!0-9]*}; y=${y%%[!0-9]*}
+    [ "${x:-0}" -gt "${y:-0}" ] && return 0
+    [ "${x:-0}" -lt "${y:-0}" ] && return 1
+  done
+  return 0
+}
+
+install_hint() {
+  local pkg=$1
+  case "$(uname -s 2>/dev/null)" in
+    Darwin)
+      if command -v brew >/dev/null 2>&1; then printf 'Install it: brew install %s' "$pkg"
+      else printf 'Install Homebrew from https://brew.sh, then: brew install %s' "$pkg"; fi ;;
+    *)
+      if command -v apt-get >/dev/null 2>&1; then printf 'Install it: sudo apt-get install %s' "$pkg"
+      elif command -v dnf >/dev/null 2>&1; then printf 'Install it: sudo dnf install %s' "$pkg"
+      else printf 'Install %s with your package manager.' "$pkg"; fi ;;
+  esac
+}
+
+show_path() { # ~-abbreviate for messages
+  case "$1" in "$HOME"/*) printf '~/%s' "${1#"$HOME"/}" ;; *) printf '%s' "$1" ;; esac
+}
+
+# ── repo + config ──────────────────────────────────────────────────────────────────────────────
+REPO_ROOT_ARG=""
+repo_root() {
+  local start="${REPO_ROOT_ARG:-$PWD}"
+  git -C "$start" rev-parse --show-toplevel 2>/dev/null || (cd "$start" 2>/dev/null && pwd)
+}
+load_repo() { # sets REPO_ROOT CFG AUTH_ENV KEY_VAR ENV_FILES ORG_ID ORG_NAME API_BASE MAIN_ROOT
+  REPO_ROOT=$(repo_root); CFG="$REPO_ROOT/.ghost/config.json"
+  AUTH_ENV=prod
+  [ "${USE_LOCAL:-0}" = 1 ] && [ "$(cfg '.api.allow_local_switch')" = true ] && AUTH_ENV=local
+  KEY_VAR=$(cfg ".auth.$AUTH_ENV.env_var"); KEY_VAR=${KEY_VAR:-GHOST_HUNTING_API_KEY}
+  ENV_FILES=$(cfg ".auth.$AUTH_ENV.env_files[]"); ENV_FILES=${ENV_FILES:-.env}
+  ORG_ID=$(cfg ".auth.$AUTH_ENV.org_id"); ORG_NAME=$(cfg ".auth.$AUTH_ENV.org_name")
+  # --local in a repo whose config has no local switch: the prod Coven binding does not apply to
+  # a local backend (different database, different org ids).
+  [ "${USE_LOCAL:-0}" = 1 ] && [ "$AUTH_ENV" = prod ] && { ORG_ID=""; ORG_NAME=""; }
+  if [ "${USE_LOCAL:-0}" = 1 ]; then API_BASE=$(cfg '.api.local_base'); API_BASE=${API_BASE:-$LOCAL_API}
+  else API_BASE=$(cfg '.api.base'); API_BASE=${API_BASE:-$PROD_API}; fi
+  [ -n "${API_BASE_ARG:-}" ] && API_BASE=$API_BASE_ARG
+  [ -n "${GHOST_KIT_API_BASE:-}" ] && [ -z "${API_BASE_ARG:-}" ] && API_BASE=$GHOST_KIT_API_BASE
+  API_BASE=${API_BASE%/}
+  MAIN_ROOT=$(git -C "$REPO_ROOT" worktree list --porcelain 2>/dev/null | sed -n '1s/^worktree //p')
+}
+cfg() { [ -f "${CFG:-}" ] && jq -r "$1 // empty" "$CFG" 2>/dev/null || true; }
+
+org_var() { # GHOST_HUNTING_API_KEY__<ORG8>
+  local o8; o8=$(printf '%s' "$1" | cut -c1-8 | tr '[:lower:]' '[:upper:]')
+  printf '%s' "$o8" | grep -Eq '^[0-9A-F]{8}$' || return 1
+  printf 'GHOST_HUNTING_API_KEY__%s' "$o8"
+}
+
+# read_key FILE VAR -> first non-empty value; never evaluates the file as shell.
+read_key() {
+  [ -f "$1" ] || return 0
+  sed -n -e 's/^[[:space:]]*//' -e 's/^export[[:space:]][[:space:]]*//' -e "s/^$2=//p" "$1" 2>/dev/null \
+    | tr -d "\"'[:space:]" | sed -n '/./{p;q;}'
+}
+key_line_no() { [ -f "$1" ] && grep -n "^[[:space:]]*\(export[[:space:]][[:space:]]*\)\{0,1\}$2=" "$1" 2>/dev/null | head -n 1 | cut -d: -f1; }
+
+# Same lookup order as PHASE0.md, runtime/project.mjs credential() and the engine preambles.
+resolve_key() { # sets KEY KEY_SRC KEY_SRC_VAR
+  KEY=""; KEY_SRC=""; KEY_SRC_VAR="$KEY_VAR"
+  KEY=$(printenv "$KEY_VAR" 2>/dev/null || true)
+  [ -n "$KEY" ] && { KEY_SRC="env:$KEY_VAR"; return 0; }
+  local f main_key ov
+  for f in $(printf '%s\n' "$ENV_FILES"); do
+    KEY=$(read_key "$REPO_ROOT/$f" "$KEY_VAR"); [ -n "$KEY" ] && { KEY_SRC="$REPO_ROOT/$f"; return 0; }
+  done
+  if [ -n "$MAIN_ROOT" ] && [ "$MAIN_ROOT" != "$REPO_ROOT" ]; then
+    main_key=$(jq -r --arg e "$AUTH_ENV" '.auth[$e].env_var // empty' "$MAIN_ROOT/.ghost/config.json" 2>/dev/null)
+    if [ "$main_key" = "$KEY_VAR" ]; then
+      for f in $(printf '%s\n' "$ENV_FILES"); do
+        KEY=$(read_key "$MAIN_ROOT/$f" "$KEY_VAR"); [ -n "$KEY" ] && { KEY_SRC="$MAIN_ROOT/$f"; return 0; }
+      done
+    fi
+  fi
+  if [ -n "$ORG_ID" ]; then
+    ov=$(org_var "$ORG_ID") || return 0
+    KEY=$(read_key "$USER_ENV" "$ov"); [ -n "$KEY" ] && { KEY_SRC="$USER_ENV"; KEY_SRC_VAR="$ov"; }
+    return 0
+  fi
+  KEY=$(read_key "$CLAUDE_DIR/.env" "$KEY_VAR"); [ -n "$KEY" ] && KEY_SRC="$CLAUDE_DIR/.env"
+  return 0
+}
+src_label() { case "$KEY_SRC" in env:*) printf 'the %s environment variable' "${KEY_SRC#env:}" ;; "$REPO_ROOT"/*) printf './%s' "${KEY_SRC#"$REPO_ROOT"/}" ;; *) show_path "$KEY_SRC" ;; esac; }
+
+# ── HTTP ───────────────────────────────────────────────────────────────────────────────────────
+# http METHOD URL BODYFILE OUTFILE [AUTH] -> prints the status code (000 on a transport failure)
+http() {
+  local code auth="X-Ghost-Kit: 1"
+  [ -n "${5:-}" ] && auth="Authorization: Bearer $5"
+  if [ -n "$3" ]; then
+    code=$(curl -s --max-time 20 -X "$1" -o "$4" -w '%{http_code}' -H 'Content-Type: application/json' \
+      -H "$auth" -H "X-Ghost-Client: plugin/$(plugin_version) skill/ghost-kit" --data-binary "@$3" "$2" 2>/dev/null)
+  else
+    code=$(curl -s --max-time 20 -X "$1" -o "$4" -w '%{http_code}' -H 'Content-Type: application/json' \
+      -H "$auth" -H "X-Ghost-Client: plugin/$(plugin_version) skill/ghost-kit" "$2" 2>/dev/null)
+  fi
+  printf '%s' "${code:-000}"
+}
+
+# ── config dir (the sandbox check) ─────────────────────────────────────────────────────────────
+SANDBOX_HINT() {
+  say "ghost-kit can't write to $(show_path "$CONF_DIR") from here (a sandbox or file permissions block it)."
+  say "Run the login yourself — in Claude Code, type this line (the leading ! runs it in your terminal):"
+  say "  ! \"$PLUGIN_ROOT/scripts/ghost-kit\" login"
+}
+ensure_conf_dir() {
+  if ! { mkdir -p "$CONF_DIR" 2>/dev/null && chmod 700 "$CONF_DIR" 2>/dev/null; }; then SANDBOX_HINT; return 12; fi
+  local probe="$CONF_DIR/.write-probe.$$"
+  if ! ( umask 077; : > "$probe" ) 2>/dev/null; then SANDBOX_HINT; return 12; fi
+  rm -f "$probe"
+  if [ -e "$USER_ENV" ] && [ ! -w "$USER_ENV" ]; then SANDBOX_HINT; return 12; fi
+  return 0
+}
+
+open_browser() {
+  [ "${NO_BROWSER:-0}" = 1 ] && return 1
+  [ "${GHOST_KIT_NO_BROWSER:-0}" = 1 ] && return 1
+  case "$(uname -s 2>/dev/null)" in
+    Darwin) command -v open >/dev/null 2>&1 && { open "$1" >/dev/null 2>&1 & return 0; } ;;
+    *) command -v xdg-open >/dev/null 2>&1 && { xdg-open "$1" >/dev/null 2>&1 & return 0; } ;;
+  esac
+  return 1
+}
+
+client_name() {
+  local n
+  n=$(scutil --get ComputerName 2>/dev/null || true)
+  [ -n "$n" ] || n=$(hostname 2>/dev/null || true)
+  n=$(printf 'Claude Code on %s' "${n:-this computer}" | tr -d '[:cntrl:]' | cut -c1-64)
+  printf '%s' "$n"
+}
+
+print_code() { # uc url opened
+  say "Code: $1"
+  if [ "$3" = 1 ]; then say "Approve it in the browser window that just opened: $2"
+  else say "Open this link and approve the code: $2"; fi
+}
+
+# ── login ──────────────────────────────────────────────────────────────────────────────────────
+login_start() {
+  need curl; need jq
+  ensure_conf_dir || return $?
+  local now exp base hint uc url opened body out code dc ttl interval
+  now=$(date +%s)
+  if [ -f "$PENDING" ] && jq -e . "$PENDING" >/dev/null 2>&1; then
+    exp=$(jq -r '.expires_at // 0' "$PENDING"); base=$(jq -r '.api_base // ""' "$PENDING"); hint=$(jq -r '.org_hint // ""' "$PENDING")
+    case "$exp" in ''|*[!0-9]*) exp=0 ;; esac
+    if [ "$exp" -gt $((now + 60)) ] && [ "$base" = "$API_BASE" ] && [ "$hint" = "$ORG_HINT" ]; then
+      uc=$(jq -r '.user_code' "$PENDING"); url=$(jq -r '.verification_uri_complete' "$PENDING")
+      opened=0; open_browser "$url" && opened=1
+      print_code "$uc" "$url" "$opened"
+      return 0
+    fi
+  fi
+  body=$(mktmp) && out=$(mktmp) || return 1
+  jq -n --arg c "$(client_name)" --arg h "$ORG_HINT" '{client_name: $c, org_hint: (if $h == "" then null else $h end)}' > "$body"
+  code=$(http POST "$API_BASE/api/cli/login" "$body" "$out")
+  case "$code" in
+    200) ;;
+    000) err "can't reach Ghost Hunting at $API_BASE — check your connection and try again."; return 1 ;;
+    404) err "this Ghost Hunting server ($API_BASE) does not offer browser login yet."; return 1 ;;
+    429) err "too many login attempts from this network — wait a minute and try again."; return 1 ;;
+    *) err "Ghost Hunting answered HTTP $code when starting the login."; return 1 ;;
+  esac
+  dc=$(jq -r '.device_code // empty' "$out"); uc=$(jq -r '.user_code // empty' "$out")
+  url=$(jq -r '.verification_uri_complete // empty' "$out")
+  ttl=$(jq -r '.expires_in // 1200' "$out"); interval=$(jq -r '.interval // 5' "$out")
+  case "$ttl" in ''|*[!0-9]*) ttl=1200 ;; esac
+  case "$interval" in ''|*[!0-9]*) interval=5 ;; esac
+  [ -n "$dc" ] && [ -n "$uc" ] && [ -n "$url" ] || { err "the login response was missing its code."; return 1; }
+  ( umask 077
+    jq -n --arg b "$API_BASE" --arg d "$dc" --arg u "$uc" --arg v "$(jq -r '.verification_uri // empty' "$out")" \
+      --arg c "$url" --argjson e $((now + ttl)) --argjson i "$interval" --arg h "$ORG_HINT" \
+      '{api_base: $b, device_code: $d, user_code: $u, verification_uri: $v, verification_uri_complete: $c,
+        expires_at: $e, interval: $i, org_hint: (if $h == "" then null else $h end)}' > "$PENDING.tmp" \
+      && chmod 600 "$PENDING.tmp" && mv "$PENDING.tmp" "$PENDING" ) 2>/dev/null || { SANDBOX_HINT; return 12; }
+  opened=0; open_browser "$url" && opened=1
+  print_code "$uc" "$url" "$opened"
+  return 0
+}
+
+save_key() { # $1 = token response file. Never prints the key.
+  local talisman org orgn agent var tmp
+  talisman=$(jq -r '.talisman // empty' "$1"); org=$(jq -r '.org_id // empty' "$1")
+  orgn=$(jq -r '.org_name // empty' "$1"); agent=$(jq -r '.agent_name // empty' "$1")
+  printf '%s' "$org" | grep -Eq "$UUID_RE" || { err "the server returned no valid Coven id; nothing was saved."; return 1; }
+  case "$talisman" in ''|*[[:space:]\"\']*) err "the server returned an unusable API key; nothing was saved."; return 1 ;; esac
+  var=$(org_var "$org") || { err "could not derive the key name for Coven $org."; return 1; }
+  tmp="$USER_ENV.tmp.$$"
+  if ! ( umask 077
+         { [ -f "$USER_ENV" ] && grep -v "^$var=" "$USER_ENV"; printf '%s=%s\n' "$var" "$talisman"; } > "$tmp" \
+           && chmod 600 "$tmp" && mv "$tmp" "$USER_ENV" && chmod 600 "$USER_ENV" ) 2>/dev/null; then
+    rm -f "$tmp" 2>/dev/null
+    SANDBOX_HINT
+    say "(The key the server just issued was not saved; logging in again replaces it.)"
+    return 12
+  fi
+  rm -f "$PENDING"
+  say "Connected to Ghost Hunting."
+  say "  Coven (organization): ${orgn:-$org}"
+  [ -n "$agent" ] && say "  Working as: \"$agent\""
+  say "  API key saved as $var in $(show_path "$USER_ENV") (readable only by you)"
+  say "org_id: $org"
+  say "org_name: $orgn"
+  return 0
+}
+
+login_wait() {
+  need curl; need jq
+  [ -f "$PENDING" ] && jq -e . "$PENDING" >/dev/null 2>&1 || { err "no login in progress — start one with: ghost-kit login --start"; return 1; }
+  ensure_conf_dir || return $?   # prove the key CAN be written before consuming the one-time token
+  local base dc uc exp interval deadline now code out body e hint rc fails=0
+  base=$(jq -r '.api_base' "$PENDING"); dc=$(jq -r '.device_code' "$PENDING"); uc=$(jq -r '.user_code' "$PENDING")
+  hint=$(jq -r '.org_hint // empty' "$PENDING")
+  exp=$(jq -r '.expires_at // 0' "$PENDING"); interval=$(jq -r '.interval // 5' "$PENDING")
+  case "$exp" in ''|*[!0-9]*) exp=0 ;; esac
+  case "$interval" in ''|*[!0-9]*) interval=5 ;; esac
+  deadline=$(( $(date +%s) + ${WAIT_SECS:-90} ))
+  body=$(mktmp) && out=$(mktmp) || return 1
+  jq -n --arg d "$dc" '{device_code: $d}' > "$body"
+  while :; do
+    now=$(date +%s)
+    if [ "$now" -ge "$exp" ]; then e=expired_token; code=400
+    else
+      code=$(http POST "$base/api/cli/login/token" "$body" "$out")
+      e=$(jq -r '.error // empty' "$out" 2>/dev/null)
+    fi
+    case "$code" in
+      200) save_key "$out"; rc=$?; : > "$out"; return $rc ;;
+      400)
+        case "$e" in
+          authorization_pending) fails=0 ;;
+          access_denied) rm -f "$PENDING"; say "Cancelled in the browser. Nothing was connected."; return 2 ;;
+          expired_token)
+            rm -f "$PENDING"; say "That code expired. Here is a fresh one:"
+            API_BASE=$base; ORG_HINT=$hint
+            login_start; rc=$?; [ "$rc" -eq 0 ] && return 11; return "$rc" ;;
+          *) err "unexpected answer from Ghost Hunting: ${e:-HTTP 400}"; return 1 ;;
+        esac ;;
+      429) sleep "$interval" ;;
+      000|5*) fails=$((fails + 1))
+        [ "$fails" -ge 3 ] && { err "can't reach Ghost Hunting at $base (HTTP $code)."; return 1; } ;;
+      *) err "Ghost Hunting answered HTTP $code while waiting for approval."; return 1 ;;
+    esac
+    [ $(( $(date +%s) + interval )) -ge "$deadline" ] && break
+    sleep "$interval"
+  done
+  [ "${QUIET_PENDING:-0}" = 1 ] || say "Still waiting for code $uc to be approved in the browser."
+  return 10
+}
+
+cmd_login() {
+  local mode=both
+  ORG_HINT=""; NO_BROWSER=0; USE_LOCAL=0; API_BASE_ARG=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --start) mode=start ;;
+      --wait) mode=wait ;;
+      --org-hint) ORG_HINT="${2:-}"; shift ;;
+      --local) USE_LOCAL=1 ;;
+      --api-base) API_BASE_ARG="${2:-}"; shift ;;
+      --no-browser) NO_BROWSER=1 ;;
+      --timeout) WAIT_SECS="${2:-90}"; shift ;;
+      --repo-root) REPO_ROOT_ARG="${2:-}"; shift ;;
+      *) die "login: unknown option '$1'" ;;
+    esac
+    shift
+  done
+  need jq; need curl
+  load_repo
+  [ -z "$ORG_HINT" ] && ORG_HINT=$ORG_ID
+  [ -n "$ORG_HINT" ] && ! printf '%s' "$ORG_HINT" | grep -Eq "$UUID_RE" && die "--org-hint must be a Coven id (a UUID)"
+  case "$mode" in
+    start) login_start; return $? ;;
+    wait) login_wait; return $? ;;
+  esac
+  login_start || return $?
+  say "Waiting for approval… (Ctrl-C to stop)"
+  local fresh=0 rc
+  while :; do
+    QUIET_PENDING=1 login_wait; rc=$?
+    case "$rc" in
+      10) continue ;;
+      11) fresh=$((fresh + 1)); [ "$fresh" -ge 3 ] && { err "three codes expired unapproved — run ghost-kit login again when you're ready."; return 11; } ;;
+      *) return "$rc" ;;
+    esac
+  done
+}
+
+# ── status ─────────────────────────────────────────────────────────────────────────────────────
+STATUS_PROBLEM=none; STATUS_MSG=""; STATUS_HTTP=""; ME_NAME=""; ME_ORG=""; ME_ORG_NAME=""; SHADOW=""
+compute_status() { # needs load_repo; OFFLINE=1 skips the /me call
+  resolve_key
+  SHADOW=""
+  if [ -n "$ORG_ID" ] && [ "$KEY_SRC" != "$USER_ENV" ]; then
+    local ov uk ln
+    ov=$(org_var "$ORG_ID") && uk=$(read_key "$USER_ENV" "$ov")
+    if [ -n "${uk:-}" ] && [ -n "$KEY" ] && [ "$uk" != "$KEY" ]; then
+      case "$KEY_SRC" in
+        env:*) SHADOW="The ${KEY_SRC#env:} environment variable shadows your signed-in key for ${ORG_NAME:-this Coven} ($ov in $(show_path "$USER_ENV")). Unset it to use the signed-in key." ;;
+        *) ln=$(key_line_no "$KEY_SRC" "$KEY_VAR")
+           SHADOW="The $KEY_VAR line in $(src_label)${ln:+ (line $ln)} shadows your signed-in key for ${ORG_NAME:-this Coven} ($ov in $(show_path "$USER_ENV")). Delete that line to use the signed-in key." ;;
+      esac
+    fi
+  fi
+  STATUS_HTTP=""; ME_NAME=""; ME_ORG=""; ME_ORG_NAME=""
+  if [ -z "$KEY" ]; then
+    STATUS_PROBLEM=no_key
+    STATUS_MSG="There is no Ghost Hunting API key on this computer for this repo${ORG_NAME:+ ($ORG_NAME)}. Type /ghost-onboard to connect."
+    return 0
+  fi
+  [ "${OFFLINE:-0}" = 1 ] && { STATUS_PROBLEM=none; return 0; }
+  local out; out=$(mktmp) || return 1
+  STATUS_HTTP=$(http GET "$API_BASE/api/agent/me" "" "$out" "$KEY")
+  ME_NAME=$(jq -r '.name // empty' "$out" 2>/dev/null); ME_ORG=$(jq -r '.org_id // empty' "$out" 2>/dev/null)
+  ME_ORG_NAME=$(jq -r '.org_name // empty' "$out" 2>/dev/null)
+  case "$STATUS_HTTP" in
+    200)
+      if [ -n "$ORG_ID" ] && [ "$(printf '%s' "$ME_ORG" | tr '[:upper:]' '[:lower:]')" != "$(printf '%s' "$ORG_ID" | tr '[:upper:]' '[:lower:]')" ]; then
+        STATUS_PROBLEM=wrong_coven
+        STATUS_MSG="You're signed in to ${ME_ORG_NAME:-a different Coven}, but this repo belongs to ${ORG_NAME:-Coven $ORG_ID}. The API key from $(src_label) is for the wrong Coven (organization). Type /ghost-onboard to connect to ${ORG_NAME:-the right one}."
+      else STATUS_PROBLEM=none; STATUS_MSG=""; fi ;;
+    401|403) STATUS_PROBLEM=rejected; STATUS_MSG="Ghost Hunting rejected the API key from $(src_label) — revoked or expired. Type /ghost-onboard to reconnect." ;;
+    000) STATUS_PROBLEM=unreachable; STATUS_MSG="Could not reach Ghost Hunting at $API_BASE. Check your connection, then try again." ;;
+    *) STATUS_PROBLEM=http; STATUS_MSG="Ghost Hunting answered HTTP $STATUS_HTTP for the identity check." ;;
+  esac
+  return 0
+}
+status_rc() { case "$STATUS_PROBLEM" in none) echo 0 ;; no_key) echo 3 ;; rejected) echo 4 ;; wrong_coven) echo 5 ;; unreachable) echo 6 ;; *) echo 1 ;; esac; }
+
+cmd_status() {
+  local json=0
+  USE_LOCAL=0; OFFLINE=0; API_BASE_ARG=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --repo-root) REPO_ROOT_ARG="${2:-}"; shift ;;
+      --local) USE_LOCAL=1 ;;
+      --json) json=1 ;;
+      --offline) OFFLINE=1 ;;
+      --api-base) API_BASE_ARG="${2:-}"; shift ;;
+      *) die "status: unknown option '$1'" ;;
+    esac
+    shift
+  done
+  need jq; need curl
+  load_repo
+  compute_status
+  local src_disp=""; [ -n "$KEY_SRC" ] && src_disp=$(src_label)
+  if [ "$json" = 1 ]; then
+    jq -n --arg repo "$REPO_ROOT" --argjson cfg "$([ -f "$CFG" ] && echo true || echo false)" \
+      --arg org "$ORG_ID" --arg orgn "$ORG_NAME" --arg api "$API_BASE" --arg var "$KEY_SRC_VAR" \
+      --arg src "$src_disp" --arg http "$STATUS_HTTP" --arg name "$ME_NAME" --arg morg "$ME_ORG" \
+      --arg morgn "$ME_ORG_NAME" --arg p "$STATUS_PROBLEM" --arg m "$STATUS_MSG" --arg sh "$SHADOW" \
+      '{repo_root: $repo, connected_repo: $cfg, org_id: $org, org_name: $orgn, api_base: $api,
+        key_var: $var, key_source: $src, http: $http,
+        me: {name: $name, org_id: $morg, org_name: $morgn},
+        problem: $p, message: $m, shadow: $sh}'
+    return "$(status_rc)"
+  fi
+  say "Ghost Hunting — $(basename "$REPO_ROOT")"
+  if [ -f "$CFG" ]; then
+    say "  This repo: Coven (organization) ${ORG_NAME:-${ORG_ID:-not recorded}}, Séance (portfolio) $(cfg '.seance.description' | grep . || cfg '.seance.id' | grep . || echo 'not set')"
+  else
+    say "  This repo isn't connected yet — type /ghost-onboard to connect it."
+  fi
+  if [ -n "$KEY" ]; then say "  API key: $KEY_SRC_VAR from $src_disp"; fi
+  [ -n "$ME_NAME" ] && say "  Signed in as \"$ME_NAME\" in ${ME_ORG_NAME:-Coven $ME_ORG}"
+  say "  Server: $API_BASE"
+  [ -n "$STATUS_MSG" ] && say "  Problem: $STATUS_MSG"
+  [ -n "$SHADOW" ] && say "  Warning: $SHADOW"
+  return "$(status_rc)"
+}
+
+# ── logout ─────────────────────────────────────────────────────────────────────────────────────
+web_app() {
+  [ -n "${GHOST_KIT_APP_URL:-}" ] && { printf '%s' "${GHOST_KIT_APP_URL%/}"; return; }
+  case "$1" in
+    "$PROD_API") printf 'https://ghosthunting.io' ;;
+    http://localhost:8000|http://127.0.0.1:8000) printf 'http://localhost:3000' ;;
+    *) printf '' ;;
+  esac
+}
+cmd_logout() {
+  local org=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --org-id) org="${2:-}"; shift ;;
+      --repo-root) REPO_ROOT_ARG="${2:-}"; shift ;;
+      *) die "logout: unknown option '$1'" ;;
+    esac
+    shift
+  done
+  need jq
+  USE_LOCAL=0; API_BASE_ARG=""; load_repo
+  [ -n "$org" ] || org=$ORG_ID
+  local var
+  if [ -z "$org" ]; then
+    local n; n=$(grep -c '^GHOST_HUNTING_API_KEY__[0-9A-F]\{8\}=' "$USER_ENV" 2>/dev/null || true)
+    [ "${n:-0}" = 1 ] || die "which Coven? Pass --org-id <id> (this repo's config names none)."
+    var=$(grep -o '^GHOST_HUNTING_API_KEY__[0-9A-F]\{8\}' "$USER_ENV" | head -n 1)
+  else
+    var=$(org_var "$org") || die "--org-id must be a Coven id (a UUID)"
+  fi
+  if ! grep -q "^$var=" "$USER_ENV" 2>/dev/null; then say "This computer isn't signed in to that Coven ($var not found). Nothing to do."; return 0; fi
+  ensure_conf_dir || return $?
+  local tmp="$USER_ENV.tmp.$$"
+  ( umask 077; grep -v "^$var=" "$USER_ENV" > "$tmp"; chmod 600 "$tmp" && mv "$tmp" "$USER_ENV" ) 2>/dev/null || { rm -f "$tmp"; SANDBOX_HINT; return 12; }
+  say "Signed out of ${ORG_NAME:-that Coven} on this computer ($var removed from $(show_path "$USER_ENV"))."
+  local app; app=$(web_app "$API_BASE")
+  if [ -n "$app" ]; then say "The key still works until you revoke it: $app/mediums"
+  else say "The key still works until you revoke it on the Mediums page of your Ghost Hunting web app."; fi
+}
+
+# ── covens: which Covens is this computer signed in to (one /me per key; never prints a key) ──
+cmd_covens() {
+  local json=0
+  API_BASE_ARG=""; USE_LOCAL=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json) json=1 ;;
+      --api-base) API_BASE_ARG="${2:-}"; shift ;;
+      --local) USE_LOCAL=1 ;;
+      --repo-root) REPO_ROOT_ARG="${2:-}"; shift ;;
+      *) die "covens: unknown option '$1'" ;;
+    esac
+    shift
+  done
+  need jq; need curl
+  load_repo
+  local rows="[]" var key out code
+  for var in $(grep -o '^GHOST_HUNTING_API_KEY__[0-9A-F]\{8\}' "$USER_ENV" 2>/dev/null | sort -u); do
+    key=$(read_key "$USER_ENV" "$var"); [ -n "$key" ] || continue
+    out=$(mktmp) || return 1
+    code=$(http GET "$API_BASE/api/agent/me" "" "$out" "$key")
+    rows=$(jq --arg v "$var" --arg c "$code" --slurpfile me <(jq -c . "$out" 2>/dev/null || echo '{}') \
+      '. + [{key_var: $v, http: $c, org_id: ($me[0].org_id // ""), org_name: ($me[0].org_name // ""), agent_name: ($me[0].name // "")}]' <<<"$rows")
+  done
+  if [ "$json" = 1 ]; then printf '%s\n' "$rows"; return 0; fi
+  [ "$(jq 'length' <<<"$rows")" = 0 ] && { say "This computer isn't signed in to any Coven yet. Type /ghost-onboard to connect."; return 0; }
+  jq -r '.[] | if .http == "200" then "  \(.org_name) — as \"\(.agent_name)\" (\(.key_var))" else "  \(.key_var): rejected by the server (HTTP \(.http)) — sign in again with /ghost-onboard" end' <<<"$rows"
+}
+
+# ── api: one Agent API call with the right key, so the key never enters a transcript ──────────
+#   ghost-kit api GET /api/agent/seances [--org-id ID] [--data JSON] [--repo-root DIR]
+# --org-id picks the per-user key for that Coven; without it, the repo's own lookup order applies.
+cmd_api() {
+  local method="${1:-}" path="${2:-}" org="" data="" body="" out code
+  [ $# -ge 2 ] && shift 2 || die "usage: ghost-kit api METHOD /api/agent/... [--org-id ID] [--data JSON]"
+  USE_LOCAL=0; API_BASE_ARG=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --org-id) org="${2:-}"; shift ;;
+      --data) data="${2:-}"; shift ;;
+      --local) USE_LOCAL=1 ;;
+      --api-base) API_BASE_ARG="${2:-}"; shift ;;
+      --repo-root) REPO_ROOT_ARG="${2:-}"; shift ;;
+      *) die "api: unknown option '$1'" ;;
+    esac
+    shift
+  done
+  case "$method" in GET|POST|PUT|PATCH|DELETE) ;; *) die "api: METHOD must be GET, POST, PUT, PATCH or DELETE" ;; esac
+  case "$path" in /api/agent/*) ;; *) die "api: only /api/agent/ paths are supported" ;; esac
+  need jq; need curl
+  load_repo
+  if [ -n "$org" ]; then
+    printf '%s' "$org" | grep -Eq "$UUID_RE" || die "api: --org-id must be a Coven id (a UUID)"
+    KEY=$(read_key "$USER_ENV" "$(org_var "$org")")
+    [ -n "$KEY" ] || { err "this computer isn't signed in to Coven $org — type /ghost-onboard to connect."; return 3; }
+  else
+    resolve_key
+    [ -n "$KEY" ] || { err "no API key for this repo — type /ghost-onboard to connect."; return 3; }
+  fi
+  out=$(mktmp) || return 1
+  if [ -n "$data" ]; then
+    body=$(mktmp) || return 1
+    printf '%s' "$data" | jq -e . > "$body" 2>/dev/null || die "api: --data must be JSON"
+  fi
+  code=$(http "$method" "$API_BASE$path" "$body" "$out" "$KEY")
+  case "$code" in
+    2*) cat "$out"; [ -s "$out" ] && echo; return 0 ;;
+    401|403) err "Ghost Hunting rejected the API key (HTTP $code) — type /ghost-onboard to reconnect."; cat "$out" >&2; return 4 ;;
+    000) err "can't reach Ghost Hunting at $API_BASE."; return 6 ;;
+    *) err "HTTP $code from $method $path"; cat "$out" >&2; echo >&2; return 1 ;;
+  esac
+}
+
+# ── update hint (one mapping, shared with ghost-doctor.sh) ─────────────────────────────────────
+marketplace_type() { jq -r '.["ghost-kit"].source.source // empty' "$CLAUDE_DIR/plugins/known_marketplaces.json" 2>/dev/null; }
+cmd_update_hint() {
+  local t loc; t=$(marketplace_type)
+  loc=$(jq -r '.["ghost-kit"].installLocation // .["ghost-kit"].source.path // empty' "$CLAUDE_DIR/plugins/known_marketplaces.json" 2>/dev/null)
+  case "$t" in
+    directory|file) say "this ghost-kit loads in place from $(show_path "$loc") — git pull there, then restart Claude Code (plugin update commands do nothing for a directory marketplace)" ;;
+    git|github|url) say "run 'claude plugin marketplace update ghost-kit' and 'claude plugin update ghost-hunting-core@ghost-kit', then restart Claude Code (with auto-update on, a restart does this for you)" ;;
+    *) say "ghost-kit is not installed for Claude Code on this computer — install it with: $INSTALL_ONE_LINER" ;;
+  esac
+}
+
+# ── doctor ─────────────────────────────────────────────────────────────────────────────────────
+TOOLS_FAILED=0
+tool_line() { # name required(1/0) min-version note
+  local name=$1 req=$2 min=$3 note=$4 v=""
+  if ! command -v "$name" >/dev/null 2>&1; then
+    if [ "$req" = 1 ]; then say "  MISSING  $name — required. $(install_hint "$name")"; TOOLS_FAILED=1
+    else say "  -        $name — optional ($note). $(install_hint "$name")"; fi
+    return
+  fi
+  case "$name" in
+    git) v=$(git --version 2>/dev/null | sed 's/[^0-9]*\([0-9][0-9.]*\).*/\1/') ;;
+    node) v=$(node --version 2>/dev/null | sed 's/^v//') ;;
+    jq) v=$(jq --version 2>/dev/null | sed 's/^jq-//') ;;
+    curl) v=$(curl --version 2>/dev/null | head -n 1 | awk '{print $2}') ;;
+    gh) v=$(gh --version 2>/dev/null | head -n 1 | awk '{print $3}') ;;
+  esac
+  if [ -n "$min" ] && [ -n "$v" ] && ! ver_ge "$v" "$min"; then
+    if [ "$req" = 1 ]; then say "  TOO OLD  $name $v — needs $min or newer. $(install_hint "$name")"; TOOLS_FAILED=1
+    else say "  old      $name $v — $min or newer recommended ($note)."; fi
+    return
+  fi
+  say "  ok       $name ${v:-}"
+}
+check_tools() {
+  say "Tools:"
+  tool_line git 1 2.31 ""
+  tool_line curl 1 "" ""
+  tool_line jq 1 "" ""
+  tool_line gh 0 "" "opening pull requests"
+  tool_line node 0 22 "/reckoning and the Codex runtime"
+}
+cmd_doctor() {
+  local tools_only=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --tools) tools_only=1 ;;
+      --repo-root) REPO_ROOT_ARG="${2:-}"; shift ;;
+      *) die "doctor: unknown option '$1'" ;;
+    esac
+    shift
+  done
+  check_tools
+  [ "$tools_only" = 1 ] && return "$TOOLS_FAILED"
+  [ "$TOOLS_FAILED" = 1 ] && { say "Fix the missing tools above, then run this again."; return 1; }
+  local bad=0
+  say "Plugin:"
+  if jq -e '.plugins["ghost-hunting-core@ghost-kit"] // empty' "$CLAUDE_DIR/plugins/installed_plugins.json" >/dev/null 2>&1; then
+    say "  ok       ghost-hunting-core@ghost-kit v$(plugin_version) ($(marketplace_type | grep . || echo unknown) marketplace)"
+  else
+    say "  -        not installed for Claude Code (this copy: v$(plugin_version) at $(show_path "$PLUGIN_ROOT"))"
+  fi
+  say "  updates: $(cmd_update_hint)"
+  USE_LOCAL=0; OFFLINE=0; API_BASE_ARG=""; load_repo; compute_status
+  say "Sign-in:"
+  if [ "$STATUS_PROBLEM" = none ]; then say "  ok       \"${ME_NAME:-?}\" in ${ME_ORG_NAME:-?} — key $KEY_SRC_VAR from $(src_label)"
+  else say "  PROBLEM  $STATUS_MSG"; bad=1; fi
+  [ -n "$SHADOW" ] && say "  WARNING  $SHADOW"
+  say "Repo ($(basename "$REPO_ROOT")):"
+  if [ -f "$CFG" ]; then
+    "$PLUGIN_ROOT/scripts/ghost-doctor.sh" --repo-root "$REPO_ROOT" | sed 's/^/  /'
+    [ "${PIPESTATUS[0]}" = 3 ] && bad=1
+  else
+    say "  not connected — type /ghost-onboard to connect this repo"
+  fi
+  [ "$bad" = 1 ] && return 3
+  return 0
+}
+
+# ── init ───────────────────────────────────────────────────────────────────────────────────────
+cmd_init() {
+  local seance="" org="" orgn="" sname="" tf="" tb="" ta="" rites=false force=0 dry=0 settings=1 var="" base=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --seance) seance="${2:-}"; shift ;;
+      --seance-name) sname="${2:-}"; shift ;;
+      --org-id) org="${2:-}"; shift ;;
+      --org-name) orgn="${2:-}"; shift ;;
+      --tests-frontend) tf="${2:-}"; shift ;;
+      --tests-backend) tb="${2:-}"; shift ;;
+      --tests-all) ta="${2:-}"; shift ;;
+      --env-var) var="${2:-}"; shift ;;
+      --api-base) base="${2:-}"; shift ;;
+      --rites) rites=true ;;
+      --force) force=1 ;;
+      --dry-run) dry=1 ;;
+      --no-settings) settings=0 ;;
+      --repo-root) REPO_ROOT_ARG="${2:-}"; shift ;;
+      *) die "init: unknown option '$1'" ;;
+    esac
+    shift
+  done
+  need jq
+  printf '%s' "$seance" | grep -Eq "$UUID_RE" || die "init: --seance must be a Séance id (a UUID)"
+  printf '%s' "$org" | grep -Eq "$UUID_RE" || die "init: --org-id must be a Coven id (a UUID)"
+  [ -n "$orgn" ] || die "init: --org-name is required (the Coven's name, for messages)"
+  [ -z "$var" ] || printf '%s' "$var" | grep -Eq '^[A-Za-z_][A-Za-z0-9_]*$' || die "init: --env-var must be a variable name"
+  org=$(printf '%s' "$org" | tr '[:upper:]' '[:lower:]')
+  local root cfgf setf repo new tmp
+  root=$(repo_root); cfgf="$root/.ghost/config.json"; setf="$root/.claude/settings.json"; repo=$(basename "$root")
+  if [ -f "$cfgf" ] && [ "$force" != 1 ]; then
+    say "This repo is already connected ($(show_path "$cfgf")): Séance $(jq -r '.seance.id // "unset"' "$cfgf" 2>/dev/null), Coven $(jq -r '.auth.prod.org_name // .auth.prod.org_id // "unrecorded"' "$cfgf" 2>/dev/null)."
+    say "Pass --force to switch it to Séance $seance in $orgn."
+    return 4
+  fi
+  if [ -f "$cfgf" ]; then
+    jq -e . "$cfgf" >/dev/null 2>&1 || die "init: $cfgf is not valid JSON — fix or remove it first"
+    new=$(jq --arg s "$seance" --arg sn "$sname" --arg o "$org" --arg on "$orgn" --arg tb "$tb" --arg tf "$tf" --arg ta "$ta" \
+      --argjson rites "$rites" '
+      .seance = ((.seance // {}) + {id: $s} + (if $sn != "" then {description: $sn} else {} end))
+      | .auth = (.auth // {}) | .auth.prod = ((.auth.prod // {}) + {org_id: $o, org_name: $on})
+      | if $tb != "" then .tests.backend = $tb else . end
+      | if $tf != "" then .tests.frontend = $tf else . end
+      | if $ta != "" then .tests.all = $ta else . end
+      | if $rites then .workflows.vendor = reduce ("rite-cadence", "harden") as $w ((.workflows.vendor // []); if index([$w]) then . else . + [$w] end) else . end
+      ' "$cfgf") || die "init: could not update $cfgf"
+  else
+    new=$(jq -n --arg repo "$repo" --arg s "$seance" --arg sn "$sname" --arg o "$org" --arg on "$orgn" \
+      --arg base "${base:-$PROD_API}" --arg var "${var:-GHOST_HUNTING_API_KEY}" \
+      --arg tb "$tb" --arg tf "$tf" --arg ta "$ta" --argjson rites "$rites" '
+      {version: 1, repo: $repo,
+       seance: ({id: $s} + (if $sn != "" then {description: $sn} else {} end)),
+       api: {base: $base, allow_local_switch: false},
+       auth: {prod: {env_var: $var, env_files: [".env"], org_id: $o, org_name: $on}, local: null}}
+      + (if ($tb + $tf + $ta) != "" then {tests: ({}
+            + (if $tb != "" then {backend: $tb} else {} end)
+            + (if $tf != "" then {frontend: $tf} else {} end)
+            + (if $ta != "" then {all: $ta} else {} end))} else {} end)
+      + {panel: {lenses: ["staff-engineer", "product-manager", "senior-ux"]},
+         browser: {tool: "none"},
+         workflows: {vendor: (if $rites then ["rite-cadence", "harden"] else [] end)}}')
+  fi
+  local block='{"source":{"source":"git","url":"'"$MIRROR_URL"'"},"autoUpdate":true}' newset=""
+  if [ "$settings" = 1 ]; then
+    if [ -f "$setf" ]; then
+      jq -e 'type == "object"' "$setf" >/dev/null 2>&1 || die "init: $setf is not a valid JSON object — not touching it"
+      newset=$(jq --argjson mk "$block" '
+        .extraKnownMarketplaces = ((.extraKnownMarketplaces // {}) | if has("ghost-kit") then . else . + {"ghost-kit": $mk} end)
+        | .enabledPlugins = ((.enabledPlugins // {}) | if has("ghost-hunting-core@ghost-kit") then . else . + {"ghost-hunting-core@ghost-kit": true} end)' "$setf")
+    else
+      newset=$(jq -n --argjson mk "$block" '{extraKnownMarketplaces: {"ghost-kit": $mk}, enabledPlugins: {"ghost-hunting-core@ghost-kit": true}}')
+    fi
+  fi
+  if [ "$dry" = 1 ]; then
+    say "would write $(show_path "$cfgf"):"; printf '%s\n' "$new"
+    [ -n "$newset" ] && { say "would write $(show_path "$setf"):"; printf '%s\n' "$newset"; }
+    [ "$rites" = true ] && say "would render .claude/workflows/rite-cadence.js and harden.js"
+    return 0
+  fi
+  mkdir -p "$root/.ghost" || die "init: cannot create $root/.ghost"
+  tmp="$cfgf.tmp.$$"; printf '%s\n' "$new" > "$tmp" && mv "$tmp" "$cfgf" || die "init: cannot write $cfgf"
+  say "wrote .ghost/config.json"
+  if [ -n "$newset" ]; then
+    mkdir -p "$root/.claude" || die "init: cannot create $root/.claude"
+    tmp="$setf.tmp.$$"; printf '%s\n' "$newset" > "$tmp" && mv "$tmp" "$setf" || die "init: cannot write $setf"
+    say "wrote .claude/settings.json (ghost-kit marketplace + plugin; existing settings kept)"
+  fi
+  if [ "$rites" = true ]; then
+    "$PLUGIN_ROOT/scripts/render-workflows.sh" --repo-root "$root" || die "init: rendering the rite workflows failed"
+  fi
+  return 0
+}
+
+# ── main ───────────────────────────────────────────────────────────────────────────────────────
+CMD="${1:-help}"; [ $# -gt 0 ] && shift
+case "$CMD" in
+  login) cmd_login "$@"; exit $? ;;
+  status) cmd_status "$@"; exit $? ;;
+  logout) cmd_logout "$@"; exit $? ;;
+  doctor) cmd_doctor "$@"; exit $? ;;
+  init) cmd_init "$@"; exit $? ;;
+  covens) cmd_covens "$@"; exit $? ;;
+  api) cmd_api "$@"; exit $? ;;
+  update-hint) cmd_update_hint; exit 0 ;;
+  version|--version) say "ghost-kit $(plugin_version)"; exit 0 ;;
+  help|-h|--help) sed -n '2,/^set -u$/p' "$GK_BIN" | sed '$d' | sed 's/^# \{0,1\}//'; exit 0 ;;
+  *) err "unknown command '$CMD' — try: ghost-kit help"; exit 1 ;;
+esac

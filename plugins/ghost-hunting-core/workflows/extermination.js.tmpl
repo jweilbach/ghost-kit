@@ -1,0 +1,504 @@
+// DEPRECATED (sunsetting): forged rites route through forge-ritual → rite-cadence backend/frontend waves; this workflow remains for ad-hoc ghost sets only.
+export const meta = {
+  name: 'extermination',
+  description: 'DEPRECATED (sunsetting): forged rites route through forge-ritual → rite-cadence backend/frontend waves; this workflow remains for ad-hoc ghost sets only. Run a SET of ghosts (explicit ids / haunting / rite) through the proven ghost-lane in parallel waves, collate every commit onto ONE integration branch, gate + review the merged whole once, and open ONE PR. The per-ghost lane runs native in-session (no claude -p, skills untouched); MAIN is never touched — all work happens in isolated worktrees, guarded. Waves: file-disjoint + dependency-free ghosts run concurrently; file-overlappers, intra-set Spirit-Bond dependents, migration-producers, and dependency-touchers serialize. Collation is a serialized critical section (cherry-pick, never merge). Default: backend/non-visual ghosts only; pass allow_visual to accept frontend ghosts (lanes get frontend_ok: prompts + independent verifier handle frontend suites; still no in-lane browser verification). Runs must NOT overlap (scratch-DB reap is global).',
+  phases: [
+    { title: 'resolve' },
+    { title: 'analyze' },
+    { title: 'schedule' },
+    { title: 'integ-setup' },
+    { title: 'baseline' },
+    { title: 'waves' },
+    { title: 'integrate' },
+    { title: 'ship' },
+    { title: 'qa' },
+    { title: 'handoff' },
+  ],
+}
+
+// ── Rendered repo config (tokens substituted from .ghost/config.json by ghost-kit's
+//    render-workflows.sh — every token lives ONLY inside a string literal) ──────────
+const REPO           = '__CFG_repo__'
+const PLUGIN_VERSION = '__CFG_plugin_version__'
+const KEY_VAR        = '__CFG_key_var__'        // talisman env var name in the env file
+const ENV_FILE       = '__CFG_env_file__'       // repo-relative env file holding the talisman
+// auth.prod.org_id: binds the key to one Coven. When set (and only then) the talisman falls back to
+// the per-user GHOST_HUNTING_API_KEY__<ORG8> line /ghost-onboard writes — same order as PHASE0.md.
+const ORG_ID         = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test('__CFG_org_id__') ? '__CFG_org_id__' : ''
+const USER_KEY_FALLBACK = ORG_ID ? `; [ -z "$TALISMAN" ] && TALISMAN=$(awk -F= '/^GHOST_HUNTING_API_KEY__${ORG_ID.slice(0, 8).toUpperCase()}=/{sub(/^[^=]*=/, ""); print}' "\${XDG_CONFIG_HOME:-$HOME/.config}/ghost-hunting/.env" | tr -d '"'\\''[:space:]')` : ''
+const ISOLATION_MODE = '__CFG_isolation_mode__' // 'none' = repo has no isolation primitives
+const WT_SCRIPT      = '__CFG_worktree_script__'// repo-relative worktree script (provision/remove)
+const DB_SCRIPT      = '__CFG_db_script__'      // repo-relative scratch-DB script (create/url/drop/reap)
+const COMMIT_SCRIPT  = '__CFG_commit_script__'  // repo-relative secret-scanned no-push commit primitive
+const MIGRATION_GATE = '__CFG_migration_gate__' // repo-relative migration drift gate; empty = none
+const DB_PREFIX      = '__CFG_db_prefix__'      // scratch-DB name prefix (e.g. myapp)
+const TEST_BACKEND   = '__CFG_test_backend__'   // full backend-suite command, run from the repo root
+const TEST_FRONTEND  = '__CFG_test_frontend__'  // full frontend-suite command; empty = none
+
+// ── Args ────────────────────────────────────────────────────────────────
+let A = args
+if (typeof A === 'string') { try { A = JSON.parse(A) } catch (e) { A = {} } }
+if (!A || typeof A !== 'object') A = {}
+const GHOST_IDS   = Array.isArray(A.ghosts) ? A.ghosts : null
+const HAUNTING_ID = A.haunting_id || null
+const RITE_ID     = A.rite_id || null
+if (!GHOST_IDS && !HAUNTING_ID && !RITE_ID) throw new Error('extermination requires args.ghosts[] | args.haunting_id | args.rite_id')
+const BASE       = A.base_branch || 'main'
+const WAVE_CAP   = A.wave_cap || 2
+const MECH_ONLY  = !!A.mech_only
+// ALLOW_VISUAL: accept frontend/UI ghosts into the set (v1 rejected them). Passes frontend_ok
+// through to every ghost-lane so the lane prompts + independent verifier handle frontend work.
+const ALLOW_VISUAL = !!A.allow_visual
+const INTEG_CAP  = A.integration_fix_cap || 3
+const API        = A.api_base || '__CFG_api_base__'
+// May render EMPTY — every handoff-hunter reference below guards on it (never invent a user id).
+const HUMAN_HUNTER = A.human_hunter_id || '__CFG_human_hunter_id__'
+// May render EMPTY — the qa stage guards on it and skips with a log instead of crashing.
+const QA_SEANCE  = A.qa_seance_id || '__CFG_qa_seance_id__'
+// Deterministic run tag (no Date.now/Math.random in workflows) — from the set spec, valid_slug-safe.
+const RUN_TAG = 'integ' + String(HAUNTING_ID || RITE_ID || (GHOST_IDS || []).join('')).replace(/[^a-zA-Z0-9]/g, '').slice(0, 12)
+const INTEG_BRANCH = `ext/${RUN_TAG}`
+
+// ── Runtime config guards (a token may render empty — degrade loudly, never crash) ──
+// Extermination is built ON the isolation primitives: no worktree/db/commit scripts → no set runs.
+if (!WT_SCRIPT || !DB_SCRIPT || !COMMIT_SCRIPT || !DB_PREFIX) {
+  log(`ABORT: extermination requires the repo's isolation primitives in .ghost/config.json — worktree_script="${WT_SCRIPT}", db_script="${DB_SCRIPT}", commit_script="${COMMIT_SCRIPT}", db_prefix="${DB_PREFIX}" (isolation.mode="${ISOLATION_MODE}"). Configure isolation (see the ghost-kit docs) before running a set; until then run ghosts one at a time via the default ghost-lane.`)
+  return { aborted: true, stage: 'config', reason: 'missing-isolation-config' }
+}
+if (!TEST_BACKEND) log('WARN: no tests.backend command configured (.ghost/config.json) — the baseline stage is skipped and the integrate gate cannot run the full suite; verification degrades to the migration gate + panels only.')
+if (!MIGRATION_GATE) log('note: no isolation.migration_gate configured — migration-gate steps are skipped in lanes and at the integrate gate.')
+
+const CREDS = `## Credentials & context
+- This orchestrator runs from the MAIN checkout (cwd = the main repo root). Read the talisman: TALISMAN=$(awk -F= '/^${KEY_VAR}=/{print $2}' "$(git rev-parse --show-toplevel)/${ENV_FILE}" | tr -d '"'\\''[:space:]')${USER_KEY_FALLBACK}; AUTH="Authorization: Bearer $TALISMAN"; API="${API}"
+- Client header — set once, then pass -H "$XGC" on EVERY curl to $API alongside -H "$AUTH": XGC="X-Ghost-Client: plugin/${PLUGIN_VERSION} repo/${REPO} wf/$(jq -r '.bundle // empty' "$(git rev-parse --show-toplevel)/.ghost/sync-state.json" 2>/dev/null)"
+- EVP field is "content" not "body". List endpoints return {"items":[...]}.
+- pipeline_stage and context are DIFFERENT endpoints. Set a stage with PUT /pipeline-stage {"pipeline_stage":"<value>"} (valid: planning/plan_review/implementing/code_review/human_review). NEVER PUT /context with an empty or {"context_payload":{}} body — it wipes objective/acceptance_criteria/agent_notes. To edit agent_notes: GET /context, take .context_payload, merge, PUT the full unwrapped object.
+- You are running INSIDE the extermination Workflow. Do ONLY what the stage says.`
+
+// ── Resilient structured-agent gate ─────────────────────────────────────
+// A structured agent() call THROWS on a transient subagent failure (StructuredOutput-not-called
+// "flake", mid-response connection drop, terminal Overloaded) or RETURNS null (user-skip / terminal
+// death). Bare at a top-level stage (collate/integrate/exorcise/ship/…) one throw aborts the ENTIRE
+// multi-hour run uncaught, losing the bookkeeping for already-collated work. tryAgent retries the
+// transient cases, fails fast on a FATAL account error (credits/quota/auth), and on exhaustion returns
+// null so the call site's existing null-handling degrades to a clean abort instead of a crash.
+const FATAL_ERR = /out of (usage )?credits|usage limit|quota|401|403|invalid (x-)?api[- ]?key|authentication/i
+async function tryAgent(prompt, opts, tries = 3) {
+  let last = 'no attempt'
+  for (let attempt = 1; attempt <= tries; attempt++) {
+    try {
+      const r = await agent(prompt, opts)
+      if (r != null) return r
+      last = 'agent() returned null (user-skip or terminal death)'
+    } catch (e) {
+      last = String((e && e.message) || e)
+      if (FATAL_ERR.test(last)) { log(`FATAL ${opts && opts.label}: ${last} — not retrying`); return null }
+    }
+    if (attempt < tries) log(`retry ${opts && opts.label} (${attempt}/${tries - 1}) after: ${last}`)
+  }
+  log(`exhausted ${opts && opts.label} after ${tries} attempts: ${last}`)
+  return null
+}
+
+// ── Schemas ─────────────────────────────────────────────────────────────
+const RESOLVE = { type:'object', additionalProperties:false, required:['ok','ghosts','notes'], properties:{
+  ok:{type:'boolean'}, notes:{type:'string'},
+  abort_reason:{type:'string'},
+  ghosts:{type:'array', items:{ type:'object', additionalProperties:false, required:['id','title','deps'], properties:{
+    id:{type:'string'}, title:{type:'string'}, deps:{type:'array',items:{type:'string'},description:'in-SET Spirit-Bond dependency ghost ids'} } } } } }
+const ANALYSIS = { type:'object', additionalProperties:false, required:['id','files','migration','dep_toucher','visual','notes'], properties:{
+  id:{type:'string'}, files:{type:'array',items:{type:'string'}}, migration:{type:'boolean'},
+  dep_toucher:{type:'boolean',description:'touches requirements*/pyproject/package.json/lockfiles (shared dependency manifests → solo)'},
+  visual:{type:'boolean',description:'frontend/UI surface → REJECT unless allow_visual (lane default is backend/non-visual)'}, notes:{type:'string'} } }
+const BASELINE = { type:'object', additionalProperties:false, required:['ok','red_tests','notes'], properties:{
+  ok:{type:'boolean',description:'false ONLY if the suite could not RUN (collection/DB/import error) — not for individual test failures'},
+  red_tests:{type:'array',items:{type:'string'},description:'pre-existing failing test ids on the untouched base (pytest node-ids / vitest "file > name")'},
+  notes:{type:'string'} } }
+const PROV = { type:'object', additionalProperties:false, required:['ok','worktree_path','notes'], properties:{
+  ok:{type:'boolean'}, worktree_path:{type:'string'}, notes:{type:'string'} } }
+const COLLATE = { type:'object', additionalProperties:false, required:['collated','reason','new_tip'], properties:{
+  collated:{type:'boolean'}, reason:{type:'string'}, new_tip:{type:'string'} } }
+const INTEG = { type:'object', additionalProperties:false, required:['verdict','notes'], properties:{
+  verdict:{type:'string',enum:['PASS','NEEDS_WORK','ESCALATE']}, notes:{type:'string'} } }
+const SHIP = { type:'object', additionalProperties:false, required:['pr_url','pr_number','already_existed'], properties:{
+  pr_url:{type:'string'}, pr_number:{type:'integer'}, already_existed:{type:'boolean'} } }
+const QA = { type:'object', additionalProperties:false, required:['qa_parent_id','auto_passed','human_remaining'], properties:{
+  qa_parent_id:{type:'string'}, auto_passed:{type:'integer'}, human_remaining:{type:'array',items:{type:'string'}} } }
+const DONE = { type:'object', additionalProperties:false, required:['done','summary'], properties:{
+  done:{type:'boolean'}, summary:{type:'string'} } }
+
+// ── The validated wave scheduler (unit-checked in /tmp/p2_scheduler_test.js) ──
+function computeWaves(ghosts, waveCap) {
+  const cap = waveCap || 2
+  const byId = new Map(ghosts.map(g => [g.id, g]))
+  const mustSolo = g => !!(g.migration || g.dep_toucher)
+  const filesOverlap = (a, b) => { const s = new Set(a.files || []); return (b.files || []).some(f => s.has(f)) }
+  const deps = g => (g.deps || []).filter(d => byId.has(d))
+  const indeg = new Map(ghosts.map(g => [g.id, deps(g).length]))
+  const q = ghosts.filter(g => indeg.get(g.id) === 0).map(g => g.id)
+  const topo = []
+  while (q.length) {
+    const id = q.shift(); topo.push(id)
+    for (const g of ghosts) if (deps(g).includes(id)) {
+      indeg.set(g.id, indeg.get(g.id) - 1)
+      if (indeg.get(g.id) === 0) q.push(g.id)
+    }
+  }
+  if (topo.length !== ghosts.length) throw new Error('dependency cycle in set')
+  const waves = []; const placed = new Map()
+  for (const id of topo) {
+    const g = byId.get(id)
+    let minWave = 0
+    for (const d of deps(g)) minWave = Math.max(minWave, placed.get(d) + 1)
+    let w = minWave
+    for (;;) {
+      const wave = waves[w] || []
+      const members = wave.map(x => byId.get(x))
+      const full = wave.length >= cap
+      const conflictSolo = mustSolo(g) ? wave.length > 0 : members.some(mustSolo)
+      const conflictFiles = members.some(m => filesOverlap(g, m))
+      if (!full && !conflictSolo && !conflictFiles) break
+      w++
+    }
+    if (!waves[w]) waves[w] = []
+    waves[w].push(id); placed.set(id, w)
+  }
+  return waves
+}
+
+// Track ghosts exorcised at collation, so an abort/closed-PR can reverse them.
+const exorcisedAtCollation = []
+async function reverseExorcisedOnAbort(reason) {
+  if (!exorcisedAtCollation.length) return
+  await tryAgent(`${CREDS}
+
+The extermination set ABORTED before merge (${reason}). These ghosts were exorcised at collation to unblock their dependents, but their code is NOT merged: ${JSON.stringify(exorcisedAtCollation)}.
+For EACH, REVERSE the premature completion: PUT /api/agent/ghosts/<id>/status {"status":"active_haunt"} and POST a durable EVP: "exorcised-at-integration then the set ABORTED (${reason}); code NOT merged — reopened. Re-run the set or handle individually."
+Return done=true.`, { label:'compensate', phase:'handoff', schema:DONE, model:'sonnet', effort:'high' })
+}
+
+// ── Stage 1: resolve the set ────────────────────────────────────────────
+phase('resolve')
+const setSpec = GHOST_IDS ? `the explicit ghost ids ${JSON.stringify(GHOST_IDS)}`
+  : HAUNTING_ID ? `every active (non-exorcised) ghost in haunting ${HAUNTING_ID} (GET /api/agent/hauntings/${HAUNTING_ID}/ghosts or list+filter)`
+  : `every active ghost in rite ${RITE_ID} (GET /api/agent/rites/${RITE_ID}/ghosts)`
+// Model tiers (user-approved 2026-06-11): inherit for the judgment gates (analyze, baseline,
+// collate, integrate — mispredictions there silently drop work); 'sonnet' for mechanical stages.
+// Per-ghost lanes carry their own tiers in ghost-lane.js.
+const resolved = await tryAgent(`${CREDS}
+
+You are the RESOLVE stage of extermination. Build the working set from ${setSpec}.
+1. Expand to the concrete ghost id list (skip already-exorcised ghosts).
+2. For EACH ghost, GET /api/agent/ghosts/<id>/with-dependencies. Record its Spirit-Bond dependencies. A dependency is "in-set" if its id is also in this set.
+3. ABORT (ok=false, abort_reason) if any ghost has an UNEXORCISED dependency that is NOT in this set — extermination can't satisfy out-of-set bonds. (In-set bonds are fine; the scheduler orders them.)
+4. Return ok=true with ghosts=[{id, title, deps:[in-set dep ids]}].`, { label:'resolve', phase:'resolve', schema:RESOLVE, model:'sonnet', effort:'high' })
+
+if (!resolved || !resolved.ok || !resolved.ghosts || !resolved.ghosts.length) {
+  log(`ABORT at resolve: ${resolved ? (resolved.abort_reason || resolved.notes) : 'no result'}`)
+  return { aborted:true, stage:'resolve', detail: resolved }
+}
+log(`resolved ${resolved.ghosts.length} ghosts: ${resolved.ghosts.map(g => g.id.slice(0,8)).join(', ')}`)
+
+// ── Stage 2: per-ghost analysis (parallel) ──────────────────────────────
+phase('analyze')
+// deliberate inherit (no model override): file/migration predictions drive wave scheduling —
+// a miss isn't caught until realized-overlap AFTER a full lane has run.
+const analyses = (await parallel(resolved.ghosts.map(g => () => tryAgent(`${CREDS}
+
+You are an ANALYSIS agent for ghost ${g.id} ("${g.title}"). Read its context: \`curl -s -H "$AUTH" -H "$XGC" "$API/api/agent/ghosts/${g.id}/context" | jq '.context_payload'\` (objective, files, acceptance_criteria, constraints). Optionally grep the MAIN codebase at $(git rev-parse --show-toplevel) to ground predictions — but do NOT edit anything.
+Predict, for wave scheduling:
+- files: the repo-relative paths this ghost will most likely create/modify (best effort from the plan + a quick look).${ALLOW_VISUAL ? ' When the ghost context_payload.files lists paths, copy them VERBATIM (exact repo-relative strings) and add any others you predict — overlap detection compares exact strings.' : ''}
+- migration: true if it will add/alter a DB model or a schema migration (whatever migrations directory this repo uses — e.g. alembic/versions, migrations/versions, drizzle).
+- dep_toucher: true if it will touch requirements*/pyproject/package.json/lockfiles (shared dependency manifests).
+- visual: true if it touches a FRONTEND / UI surface (components, pages, styles). ${ALLOW_VISUAL ? 'Visual ghosts ARE ALLOWED in this run (allow_visual) — predict honestly; do NOT shade toward false to keep a ghost in the set.' : 'This run rejects these.'}
+Return the schema (id=${g.id}).`, { label:`analyze:${g.id.slice(0,8)}`, phase:'analyze', schema:ANALYSIS }))))
+  .filter(Boolean)
+
+const visual = analyses.filter(a => a.visual)
+const accepted = ALLOW_VISUAL ? analyses : analyses.filter(a => !a.visual)
+const setGhosts = accepted.map(a => {
+  const r = resolved.ghosts.find(g => g.id === a.id)
+  return { id:a.id, title:(r && r.title) || a.id, files:a.files || [], migration:!!a.migration, dep_toucher:!!a.dep_toucher, deps:(r && r.deps) || [] }
+})
+// Deterministic scheduling: honor the caller's args order (computeWaves breaks topo ties by input
+// order, and the resolve agent's output order is otherwise unpinned).
+if (GHOST_IDS) setGhosts.sort((a, b) => GHOST_IDS.indexOf(a.id) - GHOST_IDS.indexOf(b.id))
+// Ghosts removed from the set here (analysis agent died, or visual-rejected) must seed `dropped`,
+// or computeWaves silently erases their in-set bond (byId.has filter) and a dependent burns a
+// provisioned worktree + full lane before failing at claim.
+const dropped = []    // ghost ids dropped (unanalyzed / visual-rejected / lane escalated / collation refused)
+const unanalyzed = resolved.ghosts.map(g => g.id).filter(id => !analyses.some(a => a.id === id))
+if (unanalyzed.length) {
+  dropped.push(...unanalyzed)
+  log(`DROPPED ${unanalyzed.length} ghost(s) whose analysis agent returned nothing: ${unanalyzed.map(id => id.slice(0,8)).join(', ')}`)
+}
+if (visual.length && !ALLOW_VISUAL) {
+  dropped.push(...visual.map(v => v.id))
+  log(`REJECTED ${visual.length} visual/frontend ghost(s) from the set (default = backend/non-visual; pass allow_visual to accept): ${visual.map(v => v.id.slice(0,8)).join(', ')}`)
+} else if (visual.length) {
+  log(`ACCEPTED ${visual.length} visual/frontend ghost(s) (allow_visual): ${visual.map(v => v.id.slice(0,8)).join(', ')}`)
+}
+if (!setGhosts.length) { log('ABORT: no eligible ghosts left after analysis'); return { aborted:true, stage:'analyze', rejected_visual: visual.map(v=>v.id), unanalyzed } }
+
+// ── Stage 3: schedule ───────────────────────────────────────────────────
+phase('schedule')
+let waves
+try { waves = computeWaves(setGhosts, WAVE_CAP) } catch (e) { log(`ABORT at schedule: ${e.message}`); return { aborted:true, stage:'schedule', reason:e.message } }
+const totalGhosts = setGhosts.length
+const estTokens = totalGhosts * (MECH_ONLY ? 0.4 : 0.55) // ~M tokens/ghost from the all-inherit Stage-1 smokes — recalibrate after the first model-routed run
+log(`wave schedule (${waves.length} waves, cap ${WAVE_CAP}): ${waves.map((w,i)=>`w${i}=[${w.map(id=>id.slice(0,8)).join(',')}]`).join(' ')}`)
+log(`estimate: ${totalGhosts} ghosts ≈ ${estTokens.toFixed(1)}M tokens, ${MECH_ONLY ? 'mech-only' : 'full-panel'} mode`)
+
+// ── Stage 4: provision the integration worktree ─────────────────────────
+phase('integ-setup')
+const integProv = await tryAgent(`${CREDS}
+
+You are the INTEG-SETUP stage. Provision the integration worktree that collects every ghost's commit:
+\`"$(git rev-parse --show-toplevel)/${WT_SCRIPT}" provision ${RUN_TAG} ${BASE}\`
+Parse stdout: worktree_path = the line beginning "  worktree:". Confirm it's an absolute existing dir on branch ${INTEG_BRANCH}. If the worktree script exits nonzero (e.g. missing repo-root ${ENV_FILE}) → ok=false with the error.
+Return ok, worktree_path, notes.`, { label:'integ-setup', phase:'integ-setup', schema:PROV, model:'sonnet', effort:'high' })
+if (!integProv || !integProv.ok || !integProv.worktree_path) { log(`ABORT: integration worktree provisioning failed: ${integProv ? integProv.notes : 'no result'}`); return { aborted:true, stage:'integ-setup', detail:integProv } }
+const INTEG_WT = integProv.worktree_path
+log(`integration worktree: ${INTEG_WT} (branch ${INTEG_BRANCH})`)
+
+// ── Stage 4b: baseline — capture PRE-EXISTING test failures on the untouched integration
+//    worktree so a lane / the integrate gate is never blamed for INHERITED red (the halt's root
+//    cause). We CLASSIFY (green-at-baseline → red-after = a real regression); we do NOT abort on
+//    red tests. We abort ONLY if the suite cannot run at all (no baseline is establishable).
+phase('baseline')
+const anyVisual = ALLOW_VISUAL && visual.length > 0
+const baseline = MECH_ONLY ? { ok:true, red_tests:[], notes:'mech-only: baseline suite skipped' }
+  : !TEST_BACKEND ? { ok:true, red_tests:[], notes:'no tests.backend configured — baseline suite skipped (BASELINE_RED empty)' }
+  : await tryAgent(`${CREDS}
+
+You are the BASELINE stage. Establish the PRE-EXISTING test failures on the UNTOUCHED integration worktree ${INTEG_WT} (branch ${INTEG_BRANCH}) — no ghost has landed yet — so lanes and the integrate gate don't get blamed for inherited red. Work ONLY in ${INTEG_WT}.
+1. Create BOTH scratch DBs: \`"${INTEG_WT}/${DB_SCRIPT}" create ${DB_PREFIX}_${RUN_TAG}base_test\` AND \`"${INTEG_WT}/${DB_SCRIPT}" create ${DB_PREFIX}_${RUN_TAG}base\`.
+2. Run the backend suite: \`cd "${INTEG_WT}" && DATABASE_URL=$("${INTEG_WT}/${DB_SCRIPT}" url ${RUN_TAG}base) ${TEST_BACKEND}\`. Record every FAILED/ERROR test id (e.g. pytest's "FAILED path::Class::test" / "ERROR path::..." lines) into red_tests.${anyVisual && TEST_FRONTEND ? ` Then run the frontend suite: \`cd "${INTEG_WT}" && ${TEST_FRONTEND}\` and add each failing test ("file > name") to red_tests.` : ''}
+3. Drop both scratch DBs (always, even on failure): \`"${INTEG_WT}/${DB_SCRIPT}" drop ${DB_PREFIX}_${RUN_TAG}base_test\` and \`"${INTEG_WT}/${DB_SCRIPT}" drop ${DB_PREFIX}_${RUN_TAG}base\`.
+4. If the suite COULD NOT RUN at all (test-collection error, DB connection error, import error — NOT individual test failures) → ok=false with the error in notes; we cannot establish a baseline.
+Return ok=true even when tests FAILED (those failures ARE the baseline), red_tests = the exact failing ids (possibly empty), and a one-line note with the failure counts.`, { label:'baseline', phase:'baseline', schema:BASELINE, effort:'high' }) // deliberate model inherit: honest suite-triage judgment
+if (!baseline || !baseline.ok) {
+  log(`ABORT at baseline: the suite could not RUN on the untouched base — ${baseline ? baseline.notes : 'no result'} (fix the base, then re-run)`)
+  return { aborted:true, stage:'baseline', detail: baseline }
+}
+const BASELINE_RED = Array.isArray(baseline.red_tests) ? baseline.red_tests : []
+if (BASELINE_RED.length) log(`baseline-red (${BASELINE_RED.length} pre-existing failure(s) — will NOT block lanes/integrate): ${BASELINE_RED.slice(0,6).join(' | ')}${BASELINE_RED.length>6?' …':''}`)
+else log(`baseline clean — no pre-existing failures${!TEST_BACKEND && !MECH_ONLY ? ' (suite skipped: no tests.backend configured)' : ''}`)
+
+// ── Stage 5+6: run waves, collate serially onto the integration branch ──
+phase('waves')
+const collated = []   // ghost ids successfully collated
+for (let wi = 0; wi < waves.length; wi++) {
+  const wave = waves[wi].filter(id => !dropped.includes(id))
+  // Skip a ghost whose in-set dependency was dropped (its bond can't be satisfied).
+  const runnable = wave.filter(id => {
+    const g = setGhosts.find(x => x.id === id)
+    const blocked = (g.deps || []).some(d => dropped.includes(d))
+    if (blocked) { dropped.push(id); log(`drop ${id.slice(0,8)}: in-set dependency was dropped`) }
+    return !blocked
+  })
+  if (!runnable.length) continue
+  log(`── wave ${wi}: ${runnable.map(id=>id.slice(0,8)).join(', ')} ──`)
+
+  // Provision each ghost's worktree off the LIVE integration tip (the prior wave has landed).
+  // SERIALIZED: concurrent worktree-script runs race on `git worktree prune`/ref locks in the shared
+  // .git, and a failed provision is a permanent drop — seconds of wall-clock buys determinism.
+  const provs = []
+  for (const id of runnable) {
+    provs.push(await tryAgent(`${CREDS}
+
+Provision an isolated worktree for ghost ${id}, branched off the live integration tip:
+\`"$(git rev-parse --show-toplevel)/${WT_SCRIPT}" provision g${id.slice(0,8)} ${INTEG_BRANCH}\`
+Parse stdout for the "  worktree:" path; confirm it's an absolute existing dir. ok=false + notes on any nonzero exit.
+Return ok, worktree_path, notes.`, { label:`prov:${id.slice(0,8)}`, phase:'waves', schema:PROV, model:'sonnet', effort:'high' }))
+  }
+  const lanePlan = runnable.map((id, i) => ({ id, wt: provs[i] && provs[i].ok ? provs[i].worktree_path : null }))
+  for (const lp of lanePlan) if (!lp.wt) { dropped.push(lp.id); log(`drop ${lp.id.slice(0,8)}: worktree provisioning failed`) }
+  const ready = lanePlan.filter(lp => lp.wt)
+  if (!ready.length) continue
+
+  // Run the proven lane for each ready ghost — PARALLEL (nested workflow, partial-failure → null).
+  const laneResults = await parallel(ready.map(lp => () =>
+    workflow('ghost-lane', { ghost_id: lp.id, owns_tree: true, no_ship: true, worktree_path: lp.wt, base_branch: INTEG_BRANCH, mech_only: MECH_ONLY, frontend_ok: ALLOW_VISUAL, baseline_red: BASELINE_RED })
+      .then(r => ({ lp, r }))
+      .catch(e => ({ lp, r: null, err: String((e && e.message) || e) }))
+  ))
+
+  // SERIALIZED collation critical section — one cherry-pick at a time into the single integ worktree.
+  for (const item of laneResults) {
+    if (!item) continue
+    const { lp, r } = item
+    if (!r || r.verdict !== 'committed-no-ship' || !r.ghost_commit_sha || !r.base_sha) {
+      dropped.push(lp.id)
+      log(`drop ${lp.id.slice(0,8)}: lane did not finish clean (${r ? (r.escalated || r.verdict || 'no triple') : `null${item.err ? `: ${item.err}` : ''}`}) — already poltergeist+handed-off by the lane`)
+      // The lane's worktree is left intact for the human on escalate; reap only the unused branch later via global reap.
+      continue
+    }
+    // deliberate inherit (no model override): the one mechanical stage with an irreversible failure
+    // mode (reap deletes the branch; mis-ordering orphans the commit) — and it's serialized, so the
+    // top-tier model costs ~no wall-clock here.
+    const col = await tryAgent(`${CREDS}
+
+You are the COLLATE step for ghost ${lp.id} into the integration worktree ${INTEG_WT} (branch ${INTEG_BRANCH}). The lane committed ${r.ghost_commit_sha} on its branch ${r.branch}, forked at base ${r.base_sha}. Collation is LINEAR — cherry-pick, NEVER merge. Do EXACTLY, in order:
+0. PRE-ASSERT no cherry-pick is already in progress: \`[ ! -e "$(git -C "${INTEG_WT}" rev-parse --git-dir)/CHERRY_PICK_HEAD" ]\` MUST hold. If one is in progress (a prior collation left the worktree mid-pick), do NOT touch it — set collated=false, reason="cherry-pick-in-progress" and STOP.
+1. TIP="$(git -C "${INTEG_WT}" rev-parse HEAD)".
+2. ANCESTRY: \`git -C "${INTEG_WT}" merge-base --is-ancestor ${r.base_sha} "$TIP"\` MUST succeed (the lane forked off this branch's history; wave-mates legitimately advanced the tip — do NOT require base==tip).
+3. REALIZED-DIFF DISJOINTNESS: \`MINE="$(git -C "${INTEG_WT}" diff --name-only ${r.base_sha} ${r.ghost_commit_sha} | sort)"\`; \`SIB="$(git -C "${INTEG_WT}" diff --name-only ${r.base_sha} "$TIP" | sort)"\`; if \`comm -12 <(printf '%s\\n' "$SIB") <(printf '%s\\n' "$MINE")\` is NON-empty, this ghost actually touched a file a sibling already landed → set collated=false, reason="realized-overlap: <files>" (do NOT cherry-pick).
+4. If steps 2-3 pass: \`git -C "${INTEG_WT}" cherry-pick ${r.base_sha}..${r.ghost_commit_sha}\`. On ANY nonzero exit (conflict, empty pick, unmerged files, mid-sequence stop): \`git -C "${INTEG_WT}" cherry-pick --abort\` (ignore its error if nothing to abort), then CONFIRM the worktree is back to the tip — \`[ "$(git -C "${INTEG_WT}" rev-parse HEAD)" = "$TIP" ]\` and no CHERRY_PICK_HEAD remains (a stuck pick would poison every later collation) — set collated=false, reason="cherry-pick-failed: <the git error>". If the confirm itself fails, say so verbatim in reason.
+5. ONLY if step 4's cherry-pick exited 0: reap the ghost worktree \`"$(git rev-parse --show-toplevel)/${WT_SCRIPT}" remove g${lp.id.slice(0,8)}\` (cherry-pick MUST precede reap — remove deletes the branch and would orphan the commit otherwise; NEVER reap after a failed pick). Set collated=true, new_tip="$(git -C "${INTEG_WT}" rev-parse HEAD)".
+6. Post an EVP on ${lp.id}: "collated onto ${INTEG_BRANCH} at <new_tip>; ships in the set PR."
+Return the schema.`, { label:`collate:${lp.id.slice(0,8)}`, phase:'waves', schema:COLLATE })
+
+    if (col && col.collated) {
+      collated.push(lp.id)
+      log(`collated ${lp.id.slice(0,8)} → tip ${(col.new_tip||'').slice(0,8)}`)
+      // Bond: exorcise this ghost if any STILL-PENDING set ghost depends on it (unblocks the dependent's claim).
+      const hasDependent = setGhosts.some(x => (x.deps || []).includes(lp.id) && !dropped.includes(x.id) && !collated.includes(x.id))
+      if (hasDependent) {
+        const exo = await tryAgent(`${CREDS}
+
+Ghost ${lp.id} is collated onto the integration branch and an in-set dependent needs it exorcised to claim. Exorcise it: PUT /api/agent/ghosts/${lp.id}/status {"status":"exorcised"} and POST an EVP: "exorcised at integration to unblock an in-set dependent; code ships in the set PR (not yet merged)." Then CONFIRM it stuck: GET /api/agent/ghosts/${lp.id} and check .status — return done=true ONLY if the GET shows "exorcised"; otherwise done=false with the observed status in summary.`, { label:`exorcise:${lp.id.slice(0,8)}`, phase:'waves', schema:DONE, model:'sonnet', effort:'high' })
+        if (exo && exo.done) {
+          exorcisedAtCollation.push(lp.id)
+          log(`exorcised ${lp.id.slice(0,8)} at collation (has in-set dependent)`)
+        } else {
+          // A dependent's claim would 400 and burn a full provisioned lane — stop the set cleanly instead.
+          log(`ABORT: exorcise-at-collation failed for ${lp.id.slice(0,8)} — its dependents cannot claim`)
+          await tryAgent(`${CREDS}
+
+EXORCISE-AT-COLLATION FAILED for ghost ${lp.id} (status did not become "exorcised", so its in-set dependents cannot claim). The integration worktree ${INTEG_WT} (branch ${INTEG_BRANCH}) is left INTACT for a human. For each collated ghost ${JSON.stringify(collated)}: set status poltergeist, pipeline_stage human_review, POST an EVP explaining the abort${HUMAN_HUNTER ? `, handoff-hunter to ${HUMAN_HUNTER}` : ' (no human_hunter_id configured — SKIP handoff-hunter; the EVPs are the human surface)'}. Return done=true.`, { label:'exorcise-escalate', phase:'waves', schema:DONE, model:'sonnet', effort:'high' })
+          await reverseExorcisedOnAbort('exorcise-at-collation failed')
+          return { aborted:true, stage:'waves', reason:'exorcise-at-collation-failed', collated, dropped, integ_worktree: INTEG_WT, integ_branch: INTEG_BRANCH }
+        }
+      }
+    } else {
+      dropped.push(lp.id)
+      log(`drop ${lp.id.slice(0,8)} at collation: ${col ? col.reason : 'no result'} (worktree left for inspection)`)
+    }
+  }
+}
+
+if (!collated.length) {
+  log('ABORT: no ghosts collated')
+  await reverseExorcisedOnAbort('no ghosts collated')
+  return { aborted:true, stage:'waves', dropped }
+}
+log(`collated ${collated.length}/${totalGhosts}: ${collated.map(id=>id.slice(0,8)).join(', ')}${dropped.length?` · dropped ${dropped.length}`:''}`)
+
+// ── Stage 7: integrate once (migration gate + full suite + UI verify + cross-ghost panel, fix loop) ──
+// C2: UI verify runs the merged branch's e2e specs in a REAL browser via the repo's ext-serve harness
+// (same-origin boot on the fixed ports the repo's e2e config expects). Defined once here, interpolated
+// into the integrate prompt; skipped under mech_only (the boot is validated separately), and guarded
+// at runtime when the repo has no scripts/ext-serve.sh harness.
+const UI_VERIFY_STEP = MECH_ONLY
+  ? '2d. UI VERIFY — mech-only: SKIPPED (the boot recipe is validated separately via the ext-serve harness).'
+  : `2d. UI VERIFY — ONLY if the merged diff touches the frontend (\`git -C "${INTEG_WT}" diff --name-only origin/${BASE}...HEAD | grep -q '^frontend/'\`). The merged UI must pass REAL browser checks against the MERGED code (the shared dev servers serve MAIN, so in-lane checks cannot). HARNESS GUARD first: if \`[ -x "${INTEG_WT}/scripts/ext-serve.sh" ]\` does NOT hold, this repo has no isolated-serve harness — do NOT browser-verify against the shared dev servers; record "UI verify skipped: no ext-serve harness — e2e specs must run post-merge" VERBATIM in notes and continue to step 3. Otherwise do EXACTLY, in order:
+   - BOOT: \`BASEURL=$("${INTEG_WT}/scripts/ext-serve.sh" up "${INTEG_WT}" ${RUN_TAG}ui)\` — seeds a scratch DB and boots the backend + frontend (same-origin proxy), printing the base URL on stdout. Exit code 3 = the operator's own dev servers occupy the fixed ports → verdict=ESCALATE (a human must free the ports); any other non-zero exit → NEEDS_WORK with the printed error (e.g. a TS/build failure a UI ghost introduced).
+   - RUN: \`( cd "${INTEG_WT}/frontend" && PLAYWRIGHT_BASE_URL="$BASEURL" npx playwright test --grep @smoke )\`, plus any e2e spec files the collated ghosts ADDED but did not @smoke-tag (\`git -C "${INTEG_WT}" diff --name-only origin/${BASE}...HEAD -- 'frontend/e2e/**/*.spec.ts'\`). Quote the verbatim Playwright summary line.
+   - TEARDOWN — ALWAYS, even on failure/exception: \`"${INTEG_WT}/scripts/ext-serve.sh" down "${INTEG_WT}"\`.
+   A failing spec is a NEEDS_WORK blocker — name the failing spec(s) in notes; fix the code or the spec on the integration branch and re-verify next cycle.`
+// D: end-of-set UX/design panel — the ONE place the user-persona + PM lenses run for the whole set
+// (they are intentionally stripped from the per-ghost code-review, A1). Reviews the merged UI as one
+// coherent surface, only after 2d proves it works. Blockers loop the fix loop; concerns ride the PR.
+const UX_PANEL_STEP = MECH_ONLY
+  ? '3b. UX PANEL — mech-only: SKIPPED.'
+  : `3b. UX / DESIGN PANEL — ONLY if the merged diff touches the frontend (same check as 2d) AND 2d's UI verify PASSED or was skipped for lack of a harness (never critique the usability of something that failed to run): invoke /panel (Skill tool, skill "ghost-hunting-core:panel") on the COLLECTIVE merged diff (origin/${BASE}...HEAD) with senior-ux + product-manager + the fitting user-persona lens(es) from this repo's .claude/agents/ — the panel skill routes personas by surface. This is the ONE place the user-persona + PM lenses run for the whole set; they are intentionally NOT run per ghost. Panel BLOCKERS → NEEDS_WORK (fix on the integration branch, re-verify next cycle). Concerns/nitpicks → record them VERBATIM in notes so the PR body can carry them; do NOT block on them.`
+// Migration gate + full suite steps — guarded on the rendered config (empty token = skip loudly).
+const INTEG_MIG_STEP = MIGRATION_GATE
+  ? `1. MIGRATION GATE on the merged chain: \`"${INTEG_WT}/${MIGRATION_GATE}"\` — HARD: single head, \`upgrade head\` clean, no NEW drift. If it fails, the merged migrations conflict (e.g. two heads) — fix the down_revision chain.`
+  : `1. MIGRATION GATE: none configured for this repo (isolation.migration_gate empty) — SKIP and note "no migration gate" in notes.`
+const INTEG_SUITE_STEP = TEST_BACKEND
+  ? `2. FULL SUITE (each lane's tests were independently verified per-ghost; this catches CROSS-ghost breakage in the merged whole): create BOTH isolated DBs — \`"${INTEG_WT}/${DB_SCRIPT}" create ${DB_PREFIX}_${RUN_TAG}_test\` AND \`"${INTEG_WT}/${DB_SCRIPT}" create ${DB_PREFIX}_${RUN_TAG}\` (some integration tests hit the app engine at the BASE DATABASE_URL) — then run as ONE command: \`cd "${INTEG_WT}" && DATABASE_URL=$("${INTEG_WT}/${DB_SCRIPT}" url ${RUN_TAG}) ${TEST_BACKEND}\`${TEST_FRONTEND ? ` (and \`cd "${INTEG_WT}" && ${TEST_FRONTEND}\` if any collated ghost touched frontend)` : ''}. BASELINE-RED (pre-existing failures on the untouched base, NOT caused by this set): ${JSON.stringify(BASELINE_RED)} — a test in this list that fails is NOT a blocker; only a test NOT in this list that now fails is a cross-ghost regression.
+2b. MIGRATION REVERSIBILITY (only if the repo uses Alembic AND the merged diff adds NEW migration files — count them: \`git -C "${INTEG_WT}" diff --name-only --diff-filter=A $(git -C "${INTEG_WT}" merge-base origin/${BASE} HEAD)...HEAD -- '*alembic/versions*' '*migrations/versions*' | wc -l\`): with the SAME scratch DATABASE_URL, from the backend dir run the repo venv's \`alembic downgrade -<that count>\` then \`alembic upgrade head\` — both MUST exit clean. A one-way (irreversible) migration is a NEEDS_WORK blocker. Repos without Alembic: skip with a note.
+2c. Drop both scratch DBs (always, even on failure): \`"${INTEG_WT}/${DB_SCRIPT}" drop ${DB_PREFIX}_${RUN_TAG}_test\` and \`"${INTEG_WT}/${DB_SCRIPT}" drop ${DB_PREFIX}_${RUN_TAG}\`.`
+  : `2. FULL SUITE: SKIPPED — no tests.backend command is configured for this repo (.ghost/config.json). Note the missing test config VERBATIM in notes; the migration gate + panels are the only automated integration signal.`
+phase('integrate')
+let integ = null
+for (let cycle = 0; cycle < INTEG_CAP; cycle++) {
+  const isFix = cycle > 0
+  integ = await tryAgent(`${CREDS}
+
+You are the INTEGRATE gate of extermination (cycle ${cycle}, cap ${INTEG_CAP}) — validate the MERGED whole on the integration worktree ${INTEG_WT} (branch ${INTEG_BRANCH}, ${collated.length} collated ghosts). Work ONLY in ${INTEG_WT}.
+${isFix ? `Prior cycle flagged: ${JSON.stringify((integ && integ.notes) || '')}\nFix it in the integration worktree, then re-validate.\n` : ''}${INTEG_MIG_STEP}
+${INTEG_SUITE_STEP}
+${UI_VERIFY_STEP}
+3. CROSS-GHOST REVIEW: invoke /panel (Skill tool, skill "ghost-hunting-core:panel") scoped to INTEGRATION concerns ONLY — cross-ghost interaction, the merged migration chain, the combined surface — NOT a re-review of each ghost (those passed their own code-review). Pick lenses by what the combined diff touches (staff-engineer always). If the merged diff includes ≥1 new schema migration, staff-engineer MUST hunt the MERGED-CHAIN data-integrity class that no per-ghost review can see: (i) a cross-ghost VOCABULARY interaction — one ghost canonicalizes a column's values while another still WRITES or QUERIES the old vocabulary (a saved filter or picker still emitting free text after the column went enum → it silently matches 0 rows); (ii) deploy-ordering across the whole collated chain. Migration/data-integrity blockers → NEEDS_WORK; record its concerns/nitpicks VERBATIM in notes (as the UX panel does) so the PR body can carry them.
+${UX_PANEL_STEP}
+Map: all clean (migration gate + full suite + UI verify + cross-ghost technical panel + UX panel, each as configured/applicable) → PASS. Fixable (a migration-chain conflict, a cross-ghost test failure, a failing e2e spec, a panel blocker — technical or UX) → NEEDS_WORK and put specifics in notes. Fundamentally broken (incl. the dev-server ports being occupied) → ESCALATE.
+${isFix ? 'If you fixed something, COMMIT it on the integration branch: \`cd "'+INTEG_WT+'" && "'+INTEG_WT+'/'+COMMIT_SCRIPT+'" --message "integration fix (cycle '+cycle+')"\` (uncommitted fixes are dropped by the push; the commit script allows ext/* branches).\n' : ''}Return the schema.`, { label:`integrate#${cycle}`, phase:'integrate', schema:INTEG, effort:'xhigh' }) // deliberate model inherit: highest-stakes judgment gate, at max useful effort
+
+  log(`integrate cycle ${cycle}: ${integ ? integ.verdict : 'null'}`)
+  if (integ && integ.verdict === 'PASS') break
+  if (!integ || integ.verdict === 'ESCALATE' || cycle === INTEG_CAP - 1) {
+    await tryAgent(`${CREDS}
+
+INTEGRATION FAILED for the extermination set (${integ ? integ.verdict : 'no result'} at cycle ${cycle}). The integration worktree ${INTEG_WT} (branch ${INTEG_BRANCH}) is left INTACT for a human. For each collated ghost ${JSON.stringify(collated)}: set status poltergeist, pipeline_stage human_review, POST an EVP explaining the integration failure (${integ ? integ.notes : ''})${HUMAN_HUNTER ? `, handoff-hunter to ${HUMAN_HUNTER}` : ' (no human_hunter_id configured — SKIP handoff-hunter; the EVPs are the human surface)'}. Return done=true.`, { label:'integrate-escalate', phase:'integrate', schema:DONE, model:'sonnet', effort:'high' })
+    await reverseExorcisedOnAbort('integration failed')
+    return { aborted:true, stage:'integrate', verdict: integ ? integ.verdict : null, collated, integ_worktree: INTEG_WT, integ_branch: INTEG_BRANCH }
+  }
+}
+
+// ── Stage 8: ship ONE PR ────────────────────────────────────────────────
+phase('ship')
+const ship = await tryAgent(`${CREDS}
+
+You are the SHIP stage. Open ONE PR for the integration branch ${INTEG_BRANCH} (${collated.length} ghosts).
+1. IDEMPOTENCY: \`gh pr list --head ${INTEG_BRANCH} --json number,url --jq '.[0]'\`. If a PR exists, return it with already_existed=true.
+2. Otherwise push + open: \`git -C "${INTEG_WT}" push -u origin ${INTEG_BRANCH}\` then \`gh pr create --head ${INTEG_BRANCH} --base ${BASE} --title "extermination set (${collated.length} ghosts)" --body "<list each collated ghost id + title + its commit SHA(s) on this branch (match subjects/Ghost: trailers in \`git -C ${INTEG_WT} log --oneline origin/${BASE}..HEAD\`) so the PR is reviewable commit-by-commit; note this is a haunt-cycle set PR; each ghost passed its own code-review + the integration gate>"\` (run gh from ${INTEG_WT} or pass -R).
+2b. If the integrate stage recorded end-of-set UX/design panel concerns or nitpicks, add them to the PR body under a "## UX review (end-of-set panel)" heading so reviewers see them. Separately, if it recorded cross-ghost MIGRATION / data-integrity concerns or nitpicks (from step 3), add those under a "## Migration & data integrity" heading. Integrate-gate notes: ${JSON.stringify((integ && integ.notes) || '')}. Omit either heading whose findings are empty.
+3. CONFIRM OPEN: re-run \`gh pr list --head ${INTEG_BRANCH}\` and only report pr_url/pr_number if it now exists. (Do NOT let a failed create masquerade as success.)
+Return the schema. On push/PR failure: pr_url="" pr_number=0.`, { label:'ship', phase:'ship', schema:SHIP, model:'sonnet', effort:'high' })
+
+if (!ship || !ship.pr_url || !ship.pr_number) {
+  log('ABORT: PR not confirmed open — leaving integration worktree intact, NOT reaping')
+  await reverseExorcisedOnAbort('PR failed to open')
+  return { aborted:true, stage:'ship', collated, integ_worktree: INTEG_WT, integ_branch: INTEG_BRANCH }
+}
+log(`ship: PR ${ship.pr_url}${ship.already_existed ? ' (existed)' : ''}`)
+
+// ── Stage 9: ONE set-level QA tree (functional verification outside the review cycles) ──
+phase('qa')
+// deliberate inherit (no model override): carries the server-bound-check honesty judgment —
+// dev servers serve MAIN, not this branch; a misclassification auto-passes checks against the wrong code.
+let qa = null
+if (!QA_SEANCE) {
+  log('qa: SKIPPED — no qa_seance_id configured (.ghost/config.json seance.qa_seance_id is empty); the handoff EVPs will note that QA must be run manually')
+} else {
+  qa = await tryAgent(`${CREDS}
+
+You are the QA stage. PR ${ship.pr_url} (#${ship.pr_number}) is open for the set on branch ${INTEG_BRANCH}.
+1. IDEMPOTENCY: \`curl -s -H "$AUTH" -H "$XGC" "$API/api/agent/search?q=PR+%23${ship.pr_number}" | jq '.tasks[]? | select(.title|startswith("[QA] PR"))'\` — reuse if present.
+2. Build the tree: invoke global skill **qa-pr** with args \`--yes --seance=${QA_SEANCE}\` (Skill tool — it reads the PR via gh; needs no worktree).
+3. Run automatable checks: invoke global skill **verify-qa-ghost** with args \`<PARENT_ID> --yes\` (Skill tool).
+IMPORTANT HONESTY: http/browser checks hit the dev servers, which serve MAIN's checkout — NOT this unmerged integration branch. Any server-bound check MUST be tagged for the human (run post-merge or after checking out ${INTEG_BRANCH}); NEVER auto-pass a server-bound check against main's code. shell/code_inspection checks run against the repo and are fine to auto-run.
+Return qa_parent_id, auto_passed count, and human_remaining (titles, incl. the deferred server-bound ones).`, { label:'qa', phase:'qa', schema:QA })
+  log(`qa: parent ${qa ? qa.qa_parent_id : '?'} — ${qa ? qa.auto_passed : 0} auto-passed, ${qa ? (qa.human_remaining||[]).length : '?'} for human`)
+}
+
+// Reap the integration worktree only now — PR is confirmed open (+ QA tree built off it when configured).
+await tryAgent(`${CREDS}
+
+The set PR is open${qa ? " and QA'd" : ''}. Clean up: \`"$(git rev-parse --show-toplevel)/${WT_SCRIPT}" remove ${RUN_TAG}\` (the ${INTEG_BRANCH} branch persists on origin via the PR) and \`"$(git rev-parse --show-toplevel)/${DB_SCRIPT}" reap\` (drops any orphan scratch DBs from this run). Return done=true.`, { label:'reap', phase:'qa', schema:DONE, model:'sonnet', effort:'high' })
+
+// ── Stage 10: handoff (human merge gate) ────────────────────────────────
+phase('handoff')
+const handoff = await tryAgent(`${CREDS}
+
+You are the HANDOFF stage — the human merge gate for the extermination set. PR ${ship.pr_url} is open${qa ? ` with a QA tree (parent ${qa.qa_parent_id})` : ' (QA tree skipped — no QA séance configured; note that QA must be run manually)'}. Collated ghosts: ${JSON.stringify(collated)}.
+For EACH collated ghost that is NOT already exorcised (the exorcised-at-collation ones ${JSON.stringify(exorcisedAtCollation)} stay exorcised): set status "purgatory", pipeline_stage "human_review", POST an EVP "ready for human review + merge — PR ${ship.pr_url}; QA parent ${qa ? qa.qa_parent_id : 'n/a (skipped — run /qa-pr manually)'}; merge to complete, exorcise on merge", and request-approval.
+${HUMAN_HUNTER ? `Then ONE handoff-hunter to ${HUMAN_HUNTER} summarizing the set PR. NOTE in the handoff that ${exorcisedAtCollation.length} ghost(s) were exorcised early to satisfy in-set bonds and will be undone if the PR is closed unmerged.` : `No human_hunter_id is configured (.ghost/config.json) — SKIP handoff-hunter (do not invent a user id); instead make the LAST EVP on each ghost note that ${exorcisedAtCollation.length} ghost(s) were exorcised early to satisfy in-set bonds and will be undone if the PR is closed unmerged.`}
+Return done=true with a one-line summary.`, { label:'handoff', phase:'handoff', schema:DONE, model:'sonnet', effort:'high' })
+
+return {
+  verdict: 'set-handed-to-human',
+  pr_url: ship.pr_url,
+  pr_number: ship.pr_number,
+  integration_branch: INTEG_BRANCH,
+  collated,
+  dropped,
+  rejected_visual: visual.map(v => v.id),
+  unanalyzed,
+  exorcised_at_collation: exorcisedAtCollation,
+  qa_parent_id: qa ? qa.qa_parent_id : null,
+  handed_off: handoff ? handoff.done : false,
+}

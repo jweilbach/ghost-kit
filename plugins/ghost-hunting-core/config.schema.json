@@ -1,0 +1,237 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": ".ghost/config.json — per-repo Ghost Hunting parameterization",
+  "description": "Committed at each consumer repo's root. Ghost-kit skills read this at Phase 0. Most fields are optional and fall back to generic mode, but a declared CAPABILITY implies its keys — see the allOf conditionals at the bottom. ENFORCEMENT is scripts/ghost-doctor.sh (bash+jq, no validator dependency): it reads the property names below to flag unknown keys, and implements the same capability rules directly. The conditionals are the declarative statement of those rules for any real JSON Schema validator (editors, future CI) — they are not what runs today. Repo-specific behavior belongs HERE, never in skill copies.",
+  "$comment": "Check one repo: scripts/ghost-doctor.sh --repo-root <repo>. Check every repo: scripts/ghost-fleet.sh.",
+  "type": "object",
+  "properties": {
+    "version": { "type": "integer", "const": 1 },
+    "repo": {
+      "type": "string",
+      "description": "Repo slug sent in the X-Ghost-Client header (default: basename of the git root)"
+    },
+    "seance": {
+      "type": "object",
+      "properties": {
+        "scope": { "enum": ["seance", "coven"], "default": "seance", "description": "seance = scope skills to one portfolio (id/selector); coven = the repo's backlog spans the whole coven — listing skills operate coven-wide and placement skills resolve a target per-run" },
+        "id": { "type": "string", "format": "uuid", "description": "Séance (portfolio) UUID — preferred; skips selector resolution. Used only when scope=seance" },
+        "selector": { "type": "string", "description": "Case-insensitive regex matched against séance names when id is absent. Used only when scope=seance" },
+        "description": { "type": "string", "description": "One-line human description of what this séance tracks" },
+        "qa_seance_id": { "type": "string", "format": "uuid", "description": "Séance for QA verification trees (qa-pr)" }
+      }
+    },
+    "human_hunter_id": { "type": "string", "format": "uuid", "description": "Hunter to hand off to at human gates" },
+    "auth": {
+      "type": "object",
+      "properties": {
+        "prod": { "$ref": "#/$defs/keySource" },
+        "local": { "oneOf": [{ "$ref": "#/$defs/keySource" }, { "type": "null" }] }
+      }
+    },
+    "api": {
+      "type": "object",
+      "properties": {
+        "base": { "type": "string", "default": "https://backend-production-ea01.up.railway.app" },
+        "local_base": { "type": ["string", "null"], "default": "http://localhost:8000" },
+        "allow_local_switch": { "type": "boolean", "default": false, "description": "Whether skills accept --local to target local_base with auth.local creds" }
+      }
+    },
+    "tests": {
+      "type": "object",
+      "description": "Commands run from the repo root. Omit a key to skip that gate with a warning.",
+      "properties": {
+        "backend": { "type": "string" },
+        "frontend": { "type": "string" },
+        "all": { "type": "string" }
+      }
+    },
+    "review": {
+      "type": "object",
+      "properties": {
+        "lint": { "type": "string", "description": "Lint command review-haunt runs in Phase 3b REGARDLESS of --no-tests (CI-enforced linters that the test commands don't run). Run from repo root." }
+      }
+    },
+    "isolation": {
+      "type": "object",
+      "properties": {
+        "mode": { "enum": ["worktree", "none"], "default": "none" },
+        "worktree_script": { "type": "string", "description": "Worktree provisioner, e.g. scripts/ghost-wt.sh. MINIMAL CONTRACT — `provision <slug> [base]` MUST write, INSIDE the new worktree, every path declared under auth.*.env_files (creating parent directories, stripping DATABASE_URL so a dotenv-loaded shared-dev value cannot shadow the per-wave scratch DB). This is not a convenience: rite-cadence resolves the talisman from auth.prod.env_files[0] against the WORKTREE with NO fallback to the main checkout or ~/.claude/.env — its ONLY fallback is the per-user GHOST_HUNTING_API_KEY__<ORG8> line, and only when auth.prod.org_id is set (a repo bound to a Coven with org_id needs no per-worktree key copy at all once its users have run /ghost-onboard). Without org_id, a path it reads but you do not write yields an EMPTY talisman and a bare `Authorization: Bearer` — 401 on claim, recall, escalation EVP, exorcise and writeback. That failure is silent by nature (awk on a missing file prints nothing) and agents routinely mask it by finding the key elsewhere, so it can survive releases: ghosthunting's own script wrote only $wt/.env while the engine read $wt/backend/.env, and every worktree run 401'd for three releases. It must FAIL LOUDLY rather than degrade — a missing jq, an unparseable config or an unsafe declared path is an abort, never a quiet fallback to .env with a success message. `provision` is also reap-first (it destroys the slug's worktree and force-deletes ext/<slug>), so it is NOT a recovery command: never tell an agent to re-run it to repair a credential." },
+        "db_script": { "type": "string", "description": "Scratch-database manager, e.g. scripts/ghost-db.sh. MINIMAL CONTRACT — three subcommands, all pure DDL, all idempotent: `create <db>` (CREATE DATABASE, succeed silently if it exists), `drop <db>` (DROP DATABASE IF EXISTS, succeed silently if absent), and `url <slug>` (print ONE line: the DSN for that slug). It does NOT need to migrate or seed — rite-cadence creates AND migrates every scratch database itself, so a DDL-only script is sufficient and correct. URL CONVENTION (detected at runtime, not assumed): rite-cadence names its scratch DBs <db_prefix>_rc<slug>…_test and accepts either convention for `url <slug>` — returning the base sibling <db_prefix>_<slug> (the dual-DB shape, where gate_cmds {{db_url}} and pg-smoke consume the base verbatim while a pytest conftest appends _test), or returning the _test database itself (the single-DB shape). The engine inspects the URL, provisions and migrates whichever siblings that convention implies, and escalates immediately if `url` resolves to neither name. See ghost-hunting-core:commence-haunt for the same convention in the interactive lane. Protect real databases: refuse to create/drop your dev/prod database names." },
+        "commit_script": { "type": "string", "description": "e.g. scripts/ghost-commit.sh" },
+        "migration_gate": { "type": "string", "description": "e.g. scripts/migration-gate.sh (Alembic single-head + drift gate; required on the rite-cadence backend track)" },
+        "pg_smoke": { "type": "string", "description": "Repo path where /ghost-sync VENDORS the plugin's canonical pg-smoke.sh (genuine-Postgres ORM smoke gate for the backend track), e.g. scripts/pg-smoke.sh. The vendored copy carries a header line saying it is ghost-kit-managed (edit the plugin's scripts-payload/pg-smoke.sh, not the repo copy). This path is OVERWRITTEN verbatim by /ghost-sync on every run — it is a vendoring destination, not a place for a repo's own script. NOTE the rite-cadence gate command runs the WORKTREE's copy, so a worktree branched from an older main carries an older gate script; the engine probes for that at wave 0 and refuses rather than running a stale gate. rite-cadence appends it to backend-wave gates only when set; empty → skipped with a log note. The canonical script assumes the shared backend/venv + app.core.database + app.models convention. It refuses any database not named *_test unless the caller sets PG_SMOKE_SCRATCH=<exact-db-name> (rite-cadence does, because it points this gate at the alembic-migrated BASE database — the _test sibling is typically rebuilt from ORM metadata by a pytest conftest, which would make this gate compare the ORM against itself)." },
+        "db_migrate": { "type": "string", "description": "Migration CLI wrapper with current/upgrade/downgrade subcommands, e.g. scripts/db-migrate.sh. rite-cadence uses it to MIGRATE every scratch database it provisions (the db_script does not have to), to read pre_head, and for the migration-reversibility roundtrip (downgrade to pre-wave head → upgrade → drift gate). It must accept DATABASE_URL from the environment and MUST NOT silently fall back to a config-file or .env database when that variable is empty. Empty → provisioning leaves the scratch DB unmigrated and reversibility logs SKIP." },
+        "db_prefix": { "type": "string", "description": "Scratch-DB name prefix, e.g. myapp (rite-cadence names its scratch DBs <db_prefix>_rc<slug>…_test; empty → no prefix segment). OPTIONAL — empty is valid. Some repo _note strings wrongly list this as a backend-track blocker; only db_script and migration_gate are." }
+      }
+    },
+    "e2e": {
+      "type": "object",
+      "description": "Machine-global e2e stack managed by an up/down script (e.g. an ext-serve harness). Absent → all e2e execution machinery in merge-haunt/commence-haunt is skipped.",
+      "properties": {
+        "up_script": { "type": "string", "description": "Script with `up <worktree> <slug>` (prints Playwright base URL, exit 0 ready / 3 ports busy / 4 stack locked / else boot failed) and `down <worktree>`. e.g. scripts/ext-serve.sh" },
+        "slug": { "type": "string", "description": "Worktree/DB slug for the e2e leg (MUST differ from gate_slug so DB lifecycles never collide), e.g. mge2e" },
+        "gate_slug": { "type": "string", "description": "Slug used by the merge-gate pytest leg, e.g. mggate" },
+        "ports": { "type": "array", "items": { "type": "integer" }, "description": "Fixed ports the stack binds (the repo's e2e config hardcodes them), e.g. [9000, 3005]" },
+        "lock_dir": { "type": "string", "description": "Stack lock directory in the MAIN checkout, e.g. .claude/state/e2e-stack.lock.d" },
+        "debt_file": { "type": "string", "description": "File accumulating skipped-e2e debt, e.g. .claude/state/merge-haunt-e2e-debt" }
+      }
+    },
+    "browser": {
+      "type": "object",
+      "properties": {
+        "tool": { "enum": ["playwright", "claude-in-chrome", "none"], "default": "none" }
+      }
+    },
+    "panel": {
+      "type": "object",
+      "properties": {
+        "lenses": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Agent names for /panel. Shared trio ships in the plugin (staff-engineer, product-manager, senior-ux); repo persona agents stay in the repo's .claude/agents/"
+        }
+      }
+    },
+    "hosts": {
+      "type": "object",
+      "properties": {
+        "codex": {
+          "type": "object",
+          "properties": {
+            "models": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            },
+            "concurrency": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 16,
+              "default": 4
+            },
+            "browser": {
+              "enum": [
+                "native",
+                "playwright",
+                "none"
+              ]
+            },
+            "effort": {
+              "enum": [
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max",
+                "ultra"
+              ]
+            },
+            "path_aliases": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "persona_write_paths": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "models": {
+      "type": "object",
+      "description": "Repo-level model policy. Stage model pins in the vendored workflows are DEFAULTS; this remaps them without anyone editing an engine file (editing one is how a run ends up executing a derived, possibly stale copy).",
+      "properties": {
+        "remap": {
+          "type": "object",
+          "description": "Map a default tier to a replacement, e.g. {\"fable\": \"opus\"} when the account has no quota on that tier. Applies to every stage pinned to the mapped tier. rite-cadence reads this as its default; args.model_overrides wins per-invocation. Keys and values must match ^[A-Za-z0-9_.-]+$ — anything else is dropped at render time.",
+          "additionalProperties": { "type": "string" }
+        }
+      }
+    },
+    "implement": {
+      "type": "object",
+      "properties": {
+        "notes": { "type": "string", "description": "Stack-specific implement ordering hints, e.g. 'backend-first; alembic before seeds'" }
+      }
+    },
+    "workflows": {
+      "type": "object",
+      "properties": {
+        "vendor": {
+          "type": "array",
+          "items": { "enum": ["ghost-lane", "extermination", "rite-cadence", "harden", "reckoning"] },
+          "description": "Which workflow templates /ghost-sync renders into .claude/workflows/. Empty array = none. Primary path: rite-cadence (engine, frontend AND backend/migration waves) with harden as its child, authored via forge-ritual and run via invoke-ritual. ghost-lane and extermination are DEPRECATED (sunsetting) — kept only for ad-hoc ghost sets outside a forged rite. reckoning is the /reckoning audit engine (one Part per run); vendor it only in repos that run reckonings."
+        }
+      }
+    },
+    "reckoning": {
+      "type": "object",
+      "description": "/reckoning (holistic codebase audit) settings. Absent = the skill proposes shards per run.",
+      "properties": {
+        "shards": {
+          "type": "array",
+          "description": "The codebase split for the health Part: every tracked source file should fall in one shard. kind decides which principle groups and personas review it; group decides which workflow run it lands in.",
+          "items": {
+            "type": "object",
+            "required": ["name", "kind", "paths"],
+            "properties": {
+              "name": { "type": "string" },
+              "kind": { "enum": ["backend", "frontend", "agent-surface", "plugin", "migrations", "tests", "infra"] },
+              "group": { "type": "string" },
+              "paths": { "type": "array", "items": { "type": "string" } }
+            }
+          }
+        },
+        "shard_groups": { "type": "object", "description": "Per group: {cross_cutting: true} gives that run the whole-repo cross-cutting finders (exactly one group should).", "additionalProperties": { "type": "object", "properties": { "cross_cutting": { "type": "boolean" } } } },
+        "personas": { "type": "object", "description": "Persona key (from panel.lenses) -> the shard kinds it reviews. The plugin's own personas have defaults.", "additionalProperties": { "type": "array", "items": { "enum": ["backend", "frontend", "agent-surface", "plugin", "migrations", "tests", "infra"] } } },
+        "deps": { "type": "array", "description": "Dependency dirs symlinked into the pinned tree ONLY when the lockfile hash matches the main checkout's.", "items": { "type": "object", "required": ["lock", "dir"], "properties": { "lock": { "type": "string" }, "dir": { "type": "string" } } } },
+        "instruments": { "type": "object", "description": "Per-instrument config for scripts/reckoning-instruments.sh — see skills/reckoning/references/instruments.md." },
+        "obsolete_sigil": { "type": "string", "default": "obsolete", "description": "The Sigil a reckoning puts on an open ghost the product moved past (never exorcised)." },
+        "reference_scale": { "type": "string", "maxLength": 600, "description": "The largest tenant the repo designs for, in words (e.g. \"one org with ~171k supporters and ~2M gifts; single Postgres\"). Every finder and refuter judges growth and per-statement cost at this size instead of the test suite's fixture size, and P-scale's 'beyond the stated scale' exemption is measured against it. Absent = no stated scale: that exemption cannot be claimed for tables that grow with activity, and prep warns at launch." }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "$comment": "worktree isolation needs the worktree manager",
+      "if": { "properties": { "isolation": { "properties": { "mode": { "const": "worktree" } }, "required": ["mode"] } }, "required": ["isolation"] },
+      "then": { "properties": { "isolation": { "required": ["worktree_script"] } } }
+    },
+    {
+      "$comment": "BACKEND TRACK (engine rule R7): declaring ANY scratch-DB machinery commits you to both db_script and migration_gate. rite-cadence throws 'plan INVALID' without them — but only once a backend/migration wave is validated, i.e. after ghosts are gathered and waves authored.",
+      "if": { "properties": { "isolation": { "anyOf": [{ "required": ["db_script"] }, { "required": ["migration_gate"] }, { "required": ["pg_smoke"] }, { "required": ["db_migrate"] }] } }, "required": ["isolation"] },
+      "then": { "properties": { "isolation": { "required": ["db_script", "migration_gate"] } } }
+    },
+    {
+      "$comment": "an e2e stack needs its up script and two DISTINCT slugs (equal slugs collide on the scratch DB)",
+      "if": { "required": ["e2e"] },
+      "then": { "properties": { "e2e": { "required": ["up_script", "slug", "gate_slug"] } } }
+    }
+  ],
+  "$defs": {
+    "keySource": {
+      "type": "object",
+      "description": "Where the API key (Talisman) for this repo comes from. LOOKUP ORDER — identical in every skill's Phase 0 (PHASE0.md), runtime/project.mjs credential() and the engines: 1. the env_var environment variable; 2. this checkout's env_files, in order; 3. the same git repository's MAIN checkout env_files, only when its config names the same env_var; 4. ONLY when org_id is set: the per-user file ${XDG_CONFIG_HOME:-~/.config}/ghost-hunting/.env, read by the Coven-bound name GHOST_HUNTING_API_KEY__<ORG8> (the first 8 hex chars of org_id, uppercased) that `ghost-kit login` (/ghost-onboard) writes. That file is NEVER read by the bare env_var name — a bare name cannot say which Coven its key belongs to. Configs WITHOUT org_id keep the legacy last resort ~/.claude/.env (by env_var) and nothing else changes for them. With org_id, Phase 0 also checks GET /api/agent/me: a 401, or a key whose org_id differs from this one, STOPs with a line naming the key's source file.",
+      "properties": {
+        "env_var": { "type": "string", "default": "GHOST_HUNTING_API_KEY" },
+        "env_files": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [".env"],
+          "description": "Repo-root-relative .env paths searched in order (after the environment variable, before the main checkout and the per-user file — see keySource)"
+        },
+        "org_id": { "type": "string", "format": "uuid", "description": "The Coven (organization) this repo's work lives in. Binds the key to that Coven: enables the per-user GHOST_HUNTING_API_KEY__<ORG8> lookup, retires the legacy ~/.claude/.env read, and makes Phase 0 STOP when the resolved key belongs to a different Coven. Written by `ghost-kit init` (/ghost-onboard); also the org hint the browser login sends." },
+        "org_name": { "type": "string", "description": "The Coven's display name, for messages only (\"this repo belongs to Acme\"). Never used for lookup." }
+      }
+    }
+  }
+}
