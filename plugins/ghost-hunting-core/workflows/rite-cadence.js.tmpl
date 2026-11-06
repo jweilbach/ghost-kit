@@ -1,7 +1,7 @@
 export const meta = {
   name: 'rite-cadence',
   description:
-    'Run a HUMAN-AUTHORED, pre-validated wave plan through the plan-first/validate/execute rite cadence: per wave → parallel implementers (disjoint owned files) → ownership check → integration gate → per-ghost commit → reconcile-to-clean → migration reversibility → harden (adversarial review→fix, the child workflow) → commit fixes → exorcise. Whole-rite, GATE-STOPS: runs waves back-to-back, halts before a declared gate (stop_before), returns a resume payload, re-invocable (resume_from). Calls workflow("harden") as its one child (legal one-level nesting). SCOPE: frontend/visual waves AND backend/migration waves. BASELINE: before any wave lands the engine probes EVERY plan gate_cmd on the untouched tree (any plan declaring gate_cmds, frontend-only rites included) and records baseline_red_gates = the commands that exited nonzero WITHOUT naming a test id; at the wave gate such a command is EXCUSED with a warning (completed[].warnings, the run warnings[], the ledger and the completion EVP) instead of escalating a fully-built wave, while a gate green at base, a gate naming test ids, and the engine-appended gates all keep their existing behaviour. baseline_red_gates is its own arg with its own measured flag (baseline_red: [] must not silently assert a probe that never ran) and is passed to harden so the same excusal applies there. Backend waves (wave.backend) get a runner-owned scratch Postgres ({{db_url}} injected into gate_cmds; NOTE the backend test suite may be hermetic (e.g. sqlite) — real Postgres coverage is the engine-owned migrate + pg-smoke + migration-gate + reversibility), a hard ownership check (realized files ⊆ declared), and the drift gate on every wave. Migration waves (wave.migration) additionally require EXACTLY ONE implementer; migration files are RUNTIME-detected (never declared — revision numbers depend on the live head) and reversibility (downgrade to pre-wave head → upgrade → drift gate) runs POST-COMMIT. Every stage is model-pinned (mechanical→sonnet, build→fable, gate/baseline/reconcile→opus); a tier can be remapped without editing the engine, via .ghost/config.json models.remap (repo default) or args.model_overrides (per-invocation, wins). The backend gates (pg-smoke, migration-gate), the migration CLI, and the scratch-DB manager come from the repo\'s isolation scripts (.ghost/config.json); unconfigured optional ones skip with a log note. The engine — never db_script — creates and migrates every scratch database, so a DDL-only db_script is sufficient. MEMORY: at claim each wave recalls the Coven\'s Imprints (query = the ghosts\' title words OR-ed, per distinct Haunting) and prepends a RECALLED IMPRINTS block to every build prompt and to harden (context_notes); after harden-commit a writeback stage distils at most 5 Imprints under an attempt-unique idempotency key (writeback:rite:<primary8>:<djb2hex8>, content-addressed over the findings + learnings + escalation flag). HARDEN SAFETY: a doc-file finding "fixed" in runtime code escalates on every track; a fix outside the ownership allow-set escalates on backend waves and is committed-and-flagged on frontend waves (the same hard/warn split as ownership); behavior_change flags and the gate\'s out-of-scope hunks are surfaced in the commit body, the completion EVP and the result payload — never silently committed. OBSERVABILITY: every terminal return carries agents {spawned, died:[{label, phase}]} (tryAgent holds the only agent( call, so the count is complete; child-workflow agents are harden own), and a wave that lost refuters reports harden_verify_stats on completed[], a warnings[] line and an UNADJUDICATED entry in the completion EVP — a lost adversarial draw is a WARNING, never a refusal. LEDGER: every terminal path (complete, escalated, paused) writes a machine-readable record to <git-common-dir>/rite-cadence-ledger/<slug>.<epoch>.json — beside the parked patches, so a worktree reap cannot take it, and bash-only so a dead talisman still leaves a trace. correct-vs-engine-defect is a human field the engine always writes null.',
+    'Run a HUMAN-AUTHORED, pre-validated wave plan through the plan-first/validate/execute rite cadence: per wave → parallel implementers (disjoint owned files) → ownership check → integration gate → per-ghost commit → reconcile-to-clean → migration reversibility → harden (adversarial review→fix, the child workflow) → commit fixes → exorcise. Whole-rite, GATE-STOPS: runs waves back-to-back, halts before a declared gate (stop_before), returns a resume payload, re-invocable (resume_from). Calls workflow("harden") as its one child (legal one-level nesting). SCOPE: frontend/visual waves AND backend/migration waves. BASELINE: before any wave lands the engine probes EVERY plan gate_cmd on the untouched tree (any plan declaring gate_cmds, frontend-only rites included) and records baseline_red_gates = the commands that exited nonzero WITHOUT naming a test id; at the wave gate such a command is EXCUSED with a warning (completed[].warnings, the run warnings[], the ledger and the completion EVP) instead of escalating a fully-built wave, while a gate green at base, a gate naming test ids, and the engine-appended gates all keep their existing behaviour. baseline_red_gates is its own arg with its own measured flag (baseline_red: [] must not silently assert a probe that never ran) and is passed to harden so the same excusal applies there. Backend waves (wave.backend) get a runner-owned scratch Postgres ({{db_url}} injected into gate_cmds; NOTE the backend test suite may be hermetic (e.g. sqlite) — real Postgres coverage is the engine-owned migrate + pg-smoke + migration-gate + reversibility), a hard ownership check (realized files ⊆ declared), and the drift gate on every wave. Migration waves (wave.migration) additionally require EXACTLY ONE implementer; migration files are RUNTIME-detected (never declared — revision numbers depend on the live head) and reversibility (downgrade to pre-wave head → upgrade → drift gate) runs POST-COMMIT. Every stage is model-pinned (mechanical→sonnet, build→fable, gate/baseline/reconcile→opus); a tier can be remapped without editing the engine, via .ghost/config.json models.remap (repo default) or args.model_overrides (per-invocation, wins). The backend gates (pg-smoke, migration-gate), the migration CLI, and the scratch-DB manager come from the repo\'s isolation scripts (.ghost/config.json); unconfigured optional ones skip with a log note. The engine — never db_script — creates and migrates every scratch database, so a DDL-only db_script is sufficient. MEMORY: at claim each wave recalls the Coven\'s Imprints (query = the ghosts\' title words OR-ed, per distinct Haunting) and prepends a RECALLED IMPRINTS block to every build prompt and to harden (context_notes); after harden-commit a writeback stage distils at most 5 Imprints under an attempt-unique idempotency key (writeback:rite:<primary8>:<djb2hex8>, content-addressed over the findings + learnings + escalation flag). HARDEN SAFETY: a doc-file finding "fixed" in runtime code escalates on every track; a fix outside the ownership allow-set escalates on backend waves and is committed-and-flagged on frontend waves (the same hard/warn split as ownership); behavior_change flags and the gate\'s out-of-scope hunks are surfaced in the commit body, the completion EVP and the result payload — never silently committed. OBSERVABILITY: every terminal return carries agents {spawned, died:[{label, phase}]} (tryAgent holds the only agent( call, so the count is complete; child-workflow agents are harden own), and a wave that lost refuters reports harden_verify_stats on completed[], a warnings[] line and an UNADJUDICATED entry in the completion EVP — a lost adversarial draw is a WARNING, never a refusal. LEDGER: every terminal path (complete, escalated, paused) writes a machine-readable record to <git-common-dir>/rite-cadence-ledger/<slug>.<epoch>.json — beside the parked patches, so a worktree reap cannot take it, and bash-only so a dead talisman still leaves a trace. correct-vs-engine-defect is a human field the engine always writes null. SIBLING SITES (R8): every wave ghost carries sibling_sites ("not a defect fix", or {grep, rows:[{site, in_out, why}], shared_fix, contract?, ratchet?} where every in site is in one of the wave\'s implementers\' files and a ghost\'s files, a "fixed in wave X" out row is carried as an in row by wave X, and 2+ in sites name a shared_fix); a pure check SEPARATE from plan validation reports violations as dry_run sibling_issues (forge refuses to consecrate until it is empty) and, at run time, as warnings — it NEVER stops a run; the engine writes each in site into its owning implementer\'s build prompt.',
   phases: [
     { title: 'validate' },
     { title: 'setup' },
@@ -445,6 +445,155 @@ function validatePlan(waves) {
   return issues;
 }
 
+// ── R8 — sibling sites: a defect fix covers every site with the same defect SHAPE ──
+// Sunpath PR #518 fixed one `.date()`-on-a-UTC-instant filter and left the identical defect in 11
+// sibling filters and 2 helpers. Every wave ghost entry therefore carries `sibling_sites`: the
+// string "not a defect fix", or {grep, rows: [{site, in_out, why}], shared_fix?, contract?,
+// ratchet?}. An `in` site must be owned by one of the wave's IMPLEMENTERS (they are the only
+// ones who edit), and two or more in sites must name their shared fix.
+// DELIBERATELY SEPARATE FROM validatePlan, AND NEVER A REFUSAL. A ritual run is never stopped by
+// this check: the hard gate is forge's P5, which refuses to consecrate a plan unless dry_run's
+// sibling_issues is empty. At run time each issue is a WARNING (completed[].warnings, the run's
+// warnings[], the ledger, the completion EVP) and the wave goes on — so an old plan, a --retry of
+// an immutable invocation snapshot and a resume all keep running.
+// "Not a defect fix", optionally followed by a reason ("Not a defect fix — docs only").
+const SIBLING_NONE_RE = /^not a defect fix([^a-z]|$)/i;
+const normInOut = (v) => String(v == null ? '' : v).replace(/[`*_\s]/g, '').toLowerCase();
+// A site is `path[:line]`, `path:func`, `path::symbol` or `path#L12`, possibly backticked or bold,
+// possibly carrying git grep's `<sha>:` prefix (P1b sweeps at PLAN_SHA). The PATH is what
+// ownership is about, so everything from the first `:`, whitespace or `#L` is cut — the same rule
+// as the single-ghost check's pathof() in commence-haunt / plan-haunt.
+const sitePath = (site) => {
+  let s = String(site == null ? '' : site).replace(/[`*]/g, '').trim();
+  s = s.replace(/^[0-9a-f]{7,40}:/i, '');
+  const cut = s.search(/[:\s]|#L/);
+  if (cut >= 0) s = s.slice(0, cut);
+  return relPath(s);
+};
+const FIXED_IN_WAVE_RE = /fixed in wave\s+[`"']?([A-Za-z0-9_.-]*[A-Za-z0-9_-])/i;
+function siblingIssues(waves) {
+  const all = Array.isArray(waves) ? waves : [];
+  // A plan where NO ghost carries the field predates R8 entirely (an old ritual, a --retry of its
+  // immutable snapshot). One run-level line says so, instead of one per ghost on every wave —
+  // noise on every legacy retry would teach people to ignore the flag.
+  const carries = all.some((w) => w && (w.ghosts || []).some((g) => g && g.sibling_sites != null));
+  if (!carries) {
+    const n = all.reduce((k, w) => k + (((w && w.ghosts) || []).length), 0);
+    return n ? [{ wave: '*', ghost: null, issue: `no ghost in this plan carries sibling_sites (${n} ghost(s)) — the plan predates R8 (ghost-kit 1.11): set it on every ghost ("not a defect fix", or {grep, rows: [{site, in_out, why}]}); the sibling check did not run` }] : [];
+  }
+  const out = [];
+  all.forEach((w, wi) => {
+    if (!w || typeof w !== 'object') return;
+    const wn = w.name || `#${wi}`;
+    const implOwned = new Set();
+    for (const imp of w.implementers || []) for (const f of (imp && imp.files) || []) implOwned.add(relPath(f));
+    // Commits are staged PER GHOST from ghosts[].files, so an in site's file must sit on a ghost
+    // too — an implementer-only path is swept under the primary ghost and flagged as edited
+    // outside its declared files.
+    const ghostOwned = new Set();
+    for (const og of w.ghosts || []) for (const f of (og && og.files) || []) ghostOwned.add(relPath(f));
+    for (const g of w.ghosts || []) {
+      if (!g || !g.id) continue;
+      const push = (m) => out.push({ wave: wn, ghost: g.id, issue: `ghost ${g.id} (wave ${wn}): ${m}` });
+      const s = g.sibling_sites;
+      if (s == null) {
+        push('missing sibling_sites — set "not a defect fix" (features, new docs, refactors) or {grep, rows: [{site, in_out, why}]} (rows: [] when the grep found nothing); every in site must be in an implementer\'s files AND a ghost\'s files of this wave');
+        continue;
+      }
+      if (typeof s === 'string') {
+        if (!SIBLING_NONE_RE.test(s.trim())) push(`sibling_sites string must be "not a defect fix" (got "${s.slice(0, 60)}") — a defect fix uses the {grep, rows} object`);
+        continue;
+      }
+      if (typeof s !== 'object' || Array.isArray(s)) {
+        push('sibling_sites must be "not a defect fix" or a {grep, rows} object');
+        continue;
+      }
+      if (typeof s.grep !== 'string' || !s.grep.trim()) push('sibling_sites.grep is empty — record the command that searched for the defect\'s shape');
+      if (!Array.isArray(s.rows)) {
+        push('sibling_sites.rows must be an array ([] when the grep found nothing)');
+        continue;
+      }
+      let ins = 0;
+      s.rows.forEach((r, ri) => {
+        const site = r && typeof r.site === 'string' ? r.site.trim() : '';
+        const io = normInOut(r && r.in_out);
+        const why = r && typeof r.why === 'string' ? r.why.trim() : '';
+        if (!site) return push(`sibling_sites.rows[${ri}] has no site`);
+        if (io !== 'in' && io !== 'out') return push(`sibling site "${site}": in_out must be "in" or "out" (got "${String(r.in_out)}")`);
+        if (!why) push(`sibling site "${site}": why is empty — every row says why it is in or out`);
+        const p = sitePath(site);
+        if (io === 'out') {
+          // "fixed in wave <name>" is a promise another wave must keep: only IN rows reach a build
+          // prompt, so an unbacked promise drops the site silently.
+          const fw = FIXED_IN_WAVE_RE.exec(why);
+          if (fw) {
+            const tw = all.find((x) => x && x.name === fw[1]);
+            const kept = !!tw && (tw.ghosts || []).some((og) => og && og.sibling_sites && Array.isArray(og.sibling_sites.rows)
+              && og.sibling_sites.rows.some((r2) => r2 && normInOut(r2.in_out) === 'in' && sitePath(r2.site) === p));
+            if (!kept) push(`sibling site "${site}" is out as "fixed in wave ${fw[1]}", but no ghost of ${tw ? 'that wave' : `any wave named ${fw[1]}`} carries "${p}" as an in row — add the row there, or keep the site in this wave`);
+          }
+          return;
+        }
+        ins++;
+        if (MIGRATION_DECLARED_RE.test(p)) push(`sibling site "${site}" is an existing migration — mark it out (a migration under versions/ is never re-declared)`);
+        else if (!implOwned.has(p)) push(`sibling site "${site}" → path "${p}" is in, but no implementer of wave ${wn} owns it — add it to an implementer's files (and a ghost's files), or mark it out ("fixed in wave <name>" / "follow-up ghost <id>")`);
+        else if (!ghostOwned.has(p)) push(`sibling site "${site}" → path "${p}" is in, but no ghost of wave ${wn} lists it in files — add it to this ghost's files (commits are staged per ghost from ghosts[].files)`);
+      });
+      if (ins >= 2 && !(typeof s.shared_fix === 'string' && s.shared_fix.trim()))
+        push(`${ins} in sites and no sibling_sites.shared_fix — name the shared helper they route through, or "inline — <why>"`);
+    }
+  });
+  return out;
+}
+// The in sites ONE implementer owns, for its build prompt — engine-owned, so naming the siblings
+// to the agent that edits them never depends on the planner copying them into imp.prompt. It names
+// the ghost, and tells this implementer which of that ghost's in sites belong to someone else.
+const siblingSitesFor = (wave, imp) => {
+  const mine = new Set(((imp && imp.files) || []).map(relPath));
+  const lines = [];
+  for (const g of (wave && wave.ghosts) || []) {
+    const s = g && g.sibling_sites;
+    if (!s || typeof s !== 'object' || !Array.isArray(s.rows)) continue;
+    const ins = s.rows.filter((r) => r && normInOut(r.in_out) === 'in');
+    const sites = ins.filter((r) => mine.has(sitePath(r.site)))
+      .map((r) => `${String(r.site).trim().slice(0, 200)} — ${String(r.why || '').trim().slice(0, 200)}`);
+    if (!sites.length) continue;
+    const others = ins.filter((r) => !mine.has(sitePath(r.site))).map((r) => String(r.site).trim().slice(0, 120));
+    const ctx = [s.contract && `contract: ${String(s.contract).slice(0, 300)}`, s.shared_fix && `shared fix: ${String(s.shared_fix).slice(0, 300)}`].filter(Boolean).join('; ');
+    lines.push(`ghost ${g.id} "${String(g.title || '').slice(0, 80)}": ${sites.join('; ')}${ctx ? ` (${ctx})` : ''}${others.length ? ` — its other in sites (${others.join(', ')}) belong to other implementers: do NOT touch them` : ''}`);
+  }
+  return lines;
+};
+// Every sibling ruling of the wave, IN and OUT, for harden. Its finders run the staff-engineer
+// persona, whose "Siblings of a fixed defect" rubric hunts repo-wide; without the plan's rulings a
+// deliberate `out` ("fixed in wave X", "follow-up ghost <id>") reads as a fresh defect the fixer
+// must resolve — and an unresolvable one would escalate the run, which R8 must never do.
+const siblingRulingsBlock = (wave) => {
+  const lines = [];
+  for (const g of (wave && wave.ghosts) || []) {
+    const s = g && g.sibling_sites;
+    if (!s || typeof s !== 'object' || !Array.isArray(s.rows)) continue;
+    for (const r of s.rows) {
+      if (!r || !r.site) continue;
+      lines.push(`- ghost ${String(g.id).slice(0, 8)} · ${String(r.site).trim().slice(0, 160)} · ${normInOut(r.in_out) || '?'} · ${String(r.why || '').trim().slice(0, 160)}`);
+    }
+  }
+  if (!lines.length) return '';
+  // Whole rows only, with a count of what was dropped — a row cut mid-text, or silently missing,
+  // would read as "not ruled" and reopen exactly the finding this block exists to prevent.
+  const kept = [];
+  let size = 0;
+  for (const l of lines) {
+    if (size + l.length + 1 > 3000) break;
+    kept.push(l);
+    size += l.length + 1;
+  }
+  const dropped = lines.length - kept.length;
+  // This block LEADS context_notes: harden trims that field from the END, so the recall block
+  // after it is what gives way, never a ruling.
+  return `SIBLING SITES RULED AT PLAN TIME (this wave's plan already decided these): an "out" row is a RULED DECISION, not a finding — never report it and never fix it; an "in" row is this wave's own work, so an in site still unfixed inside the range under review IS a finding. Any other sibling outside the range under review is out of scope here.\n${kept.join('\n')}${dropped ? `\n(${dropped} more ruling(s) omitted for length — treat any sibling outside the range under review as ruled)` : ''}`;
+};
+
 // Capability degradations. Every one of these was previously a LOG LINE ONLY, so a wave that ran
 // with no secret scan, no Postgres smoke gate and no reversibility proof returned a result
 // byte-identical to one that passed all three. The human reviewing the PR could not tell them
@@ -456,6 +605,10 @@ phase('validate');
 if (!COMMIT_SCRIPT) noteSkip('run', 'secret scan (isolation.commit_script unset — commits fall back to plain git add/commit)');
 if (!COMMIT_SCRIPT) log('no commit script configured (isolation.commit_script empty) — commits fall back to plain git add/commit with a "Ghost: <id>" trailer; NO secret scan runs');
 const issues = validatePlan(WAVES);
+const SIBLING_ISSUES = issues.length ? [] : siblingIssues(WAVES);
+// The R8 issues that belong to wave `wi`: its own, plus the run-level legacy line on the first
+// wave this invocation actually runs.
+const siblingIssuesFor = (wave, wi, startIdx) => SIBLING_ISSUES.filter((s) => s.wave === wave.name || (s.wave === '*' && wi === startIdx));
 
 if (DRY_RUN) {
   const sequence = WAVES.map((w, i) => {
@@ -476,7 +629,11 @@ if (DRY_RUN) {
   });
   recall_queries.forEach((r) => log(`recall queries [${r.wave}] feature: ${r.feature || '(none)'} | mechanism: ${r.mechanism || '(none)'}`));
   issues.forEach((s) => log(`ISSUE: ${s}`));
-  return { status: issues.length ? 'invalid' : 'validated', issues, sequence, recall_queries, note: 'dry_run: pure-JS plan validation only. Live git/branch/clean/DB checks run at real setup.' };
+  SIBLING_ISSUES.forEach((s) => log(`SIBLING: ${s.issue}`));
+  // sibling_issues never makes the plan `invalid` — a run does not stop on it — but forge P5
+  // refuses to consecrate until it is empty. `sibling_sites: "checked"` lets P5 tell this engine
+  // from one that predates R8 (which would return neither key and "validate" anything).
+  return { status: issues.length ? 'invalid' : 'validated', issues, sibling_sites: issues.length ? 'skipped' : 'checked', sibling_issues: SIBLING_ISSUES.map((s) => s.issue), sequence, recall_queries, note: 'dry_run: pure-JS plan validation only. Live git/branch/clean/DB checks run at real setup.' };
 }
 
 if (issues.length) throw new Error('rite-cadence plan INVALID:\n - ' + issues.join('\n - '));
@@ -1544,6 +1701,12 @@ for (let wi = startIdx; wi < WAVES.length; wi++) {
   // value carried over from the previous wave would attribute one wave's learnings to another.
   WAVE_LEARNINGS = [];
   WAVE_WARNINGS = [];
+  // R8 never stops the run: an incomplete sibling_sites rides this wave's warnings instead.
+  for (const s of siblingIssuesFor(wave, wi, startIdx)) {
+    const line = `sibling_sites [${wave.name}]: ${s.issue} — plan-time check, not blocking`;
+    log(line);
+    WAVE_WARNINGS.push(line);
+  }
   WAVE_INHERITED_RED_GATES = [];
   WAVE_PROJECTS = [];
   WAVE_BUILD_PROVEN = false;
@@ -1767,7 +1930,7 @@ recall_status, in this precedence: "ok" when at least one call returned items (e
     wave.implementers.map((imp) => () =>
       tryAgent(
         `${common(wave, 'build')}
-${recallBlock ? recallBlock + '\n' : ''}BUILD — implementer "${imp.label}". You OWN exactly these files (create if new): ${(imp.files || []).join(', ')}${migrationNote}${dbNote}
+${recallBlock ? recallBlock + '\n' : ''}BUILD — implementer "${imp.label}". You OWN exactly these files (create if new): ${(imp.files || []).join(', ')}${migrationNote}${dbNote}${((sib) => (sib.length ? `\nSIBLING SITES (a defect fix in this wave has the same defect shape at these sites in files YOU own — fix every one, through the shared fix when one is named; if the shared fix lives in a file you do not own, call it by exactly the name given and do not write your own): ${sib.join(' | ')}` : ''))(siblingSitesFor(wave, imp))}
 Rules: edit ONLY your owned files; do NOT run git; do NOT run repo-wide auto-fixers (eslint --fix / prettier / ruff format); do NOT commit; do NOT touch any file outside your set (another implementer owns it).
 TASK: ${imp.prompt}
 Return {ok:true only if you completed AND touched only owned files, changed_files (EVERY file you created or modified, as REPO-RELATIVE paths — honesty here is the ownership check's input), note, learnings: up to 3 DURABLE, NON-OBVIOUS facts about this repo you learned the hard way while building (a trap, a house convention, an environment truth) — 1-3 sentences each, up to ~1000 chars, and SAY THE FIX, not just the symptom: "X is stale after Y — call Z first, and capture the ids before you do" is worth writing down, "watch out for X" is not. Or [] when nothing durable; never progress notes, never decisions}.`,
@@ -2019,7 +2182,7 @@ ALL rc 0 → ok:true with migrations = this wave's migration file(s). Any red �
       // engine_gate_from: harden re-runs this SAME list, so it needs the same boundary — below it
       // are the plan's own suites (which can hold an inherited red), at and above it the engine's
       // pg-smoke/migration-gate (which never can, and must never be excused by a failures list).
-      { worktree_path: WT, range: `${preSha}..HEAD`, contract_path: CONTRACT, gate_cmds: effectiveGates, engine_gate_from: engineGateFrom, baseline_red: BASELINE_RED, baseline_red_gates: (wave.gate_cmds || []).map((c, i) => (WAVE_INHERITED_RED_GATES.includes(String(c)) ? i : -1)).filter((i) => i >= 0), no_new_migrations: true, context_notes: recallBlock, strict_range: backendWave, test_path_re: TEST_PATH_SOURCE, allowed_files: Array.from(declaredSet(wave)).concat(Array.from(migAllowed), relPaths(rec.swept), relPaths(rec.flagged)) },
+      { worktree_path: WT, range: `${preSha}..HEAD`, contract_path: CONTRACT, gate_cmds: effectiveGates, engine_gate_from: engineGateFrom, baseline_red: BASELINE_RED, baseline_red_gates: (wave.gate_cmds || []).map((c, i) => (WAVE_INHERITED_RED_GATES.includes(String(c)) ? i : -1)).filter((i) => i >= 0), no_new_migrations: true, context_notes: [siblingRulingsBlock(wave), recallBlock].filter(Boolean).join('\n\n'), strict_range: backendWave, test_path_re: TEST_PATH_SOURCE, allowed_files: Array.from(declaredSet(wave)).concat(Array.from(migAllowed), relPaths(rec.swept), relPaths(rec.flagged)) },
       pin('fable') !== 'fable' ? { finder_model: pin('fable'), fixer_model: pin('fable'), gate_model: pin('fable') } : {},
       pin('opus') !== 'opus' ? { verifier_model: pin('opus') } : {},
       // wave.harden is PLAN-authored — an agent wrote it — and is merged LAST so it still wins for
@@ -2173,6 +2336,10 @@ Return paths = one entry per line: strip the two status chars + space; for renam
     // refuters that would have cast it died.
     (hard && (hard.unverified || []).length)
       ? `UNADJUDICATED (refuters died; kept by fail-loud policy, fixed anyway): ${hard.unverified.map((u) => shellSafe(String(u.title || '?')).slice(0, 80)).join(' | ').slice(0, 400)}`
+      : '',
+    // R8 issues never stopped the wave, so the durable record of a green wave must name them.
+    siblingIssuesFor(wave, wi, startIdx).length
+      ? `SIBLING SITES INCOMPLETE (plan-time check, not blocking): ${siblingIssuesFor(wave, wi, startIdx).map((s) => shellSafe(s.issue).slice(0, 160)).join(' | ').slice(0, 500)}`
       : '',
   ].filter(Boolean).join(' | ');
   if (deferredOOR.length) log(`harden DEFERRED [${wave.name}] ${deferredOOR.length} out-of-range fix(es) — the wave lands, the edit is owed: ${deferredOOR.map((d) => d.finding).join(' | ').slice(0, 300)}`);

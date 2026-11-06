@@ -34,7 +34,7 @@ Check the invocation input for these optional flags:
 - **`--autonomous`** — Skip interactive plan approval and adversarial review for non-interactive execution. Default: interactive with plan approval.
 - **`--stage=plan|implement`** — Run only part of the lifecycle, for orchestrators (e.g. a ghost-lane / extermination workflow or a ritual) that drive the phases externally. Implies `--autonomous` for the phases it runs.
   - `--stage=plan` → run **Phase 0–1 only** (bootstrap, claim, explore, design + write the plan to `agent_notes`, post the plan EVP), then **STOP**. Do **not** implement, test, report, or exorcise.
-  - `--stage=implement` → **skip Phase 1 except its 1a Imprint recall** (the plan already exists in `agent_notes` from a prior `--stage=plan` or `ghost-hunting-core:plan-haunt` run); do a minimal bootstrap (read context + read the plan from `agent_notes`; do **not** re-claim), then run **Phase 2–3** (implement + test + browser verify) and **STOP**. Do **not** exorcise or hand off.
+  - `--stage=implement` → **skip Phase 1 except its 1a Imprint recall and the Sibling-sites check** (the plan already exists in `agent_notes` from a prior `--stage=plan` or `ghost-hunting-core:plan-haunt` run); do a minimal bootstrap (read context + read the plan from `agent_notes`; do **not** re-claim), then run **Phase 2–3** (implement + test + browser verify) and **STOP**. Do **not** exorcise or hand off.
   - Omit to run the full lifecycle (Phases 0–4).
 - **`--no-exorcise`** — Run reporting (Phase 4a–4c) but **skip Phase 4d (exorcise)** and any handoff, leaving the ghost's final state to an external orchestrator. Implied by `--stage`.
 - **`--local`** — Target the repo's local API (`cfg '.api.local_base'`) with local creds instead of production. Only honored when the repo's config sets `api.allow_local_switch: true` — set `GK_LOCAL=1` before running the Phase-0 block. If the config does not allow the switch, ignore the flag and tell the user why.
@@ -98,7 +98,7 @@ case "$KEY_SRC" in "$REPO_ROOT"/*) KEY_SHOW="./${KEY_SRC#"$REPO_ROOT"/}" ;; "$HO
 # scripts/ghost-kit-release.sh. Deliberately NOT read from disk: a session loads skill
 # text once at start and holds it, so a runtime read reports what is on disk NOW, not
 # what is running. That is how a session executing v1.3.7 reported plugin/1.4.0.
-PLUGIN_VERSION="1.10.0"
+PLUGIN_VERSION="1.11.0"
 GK_ROOT="${GHOST_KIT_ROOT:-${CLAUDE_PLUGIN_ROOT:-${PLUGIN_ROOT:-}}}"
 [ -z "$GK_ROOT" ] && [ -x "$REPO_ROOT/.ghost/bin/resolve-plugin" ] && GK_ROOT=$("$REPO_ROOT/.ghost/bin/resolve-plugin" 2>/dev/null)
 GK_SRC=$(jq -r '.["ghost-kit"].installLocation // empty' "$HOME/.claude/plugins/known_marketplaces.json" 2>/dev/null)
@@ -280,7 +280,7 @@ Parse stdout for the line beginning `  worktree:` → that absolute path is **`$
 
 ## Phase 1 — Plan
 
-**Stage gate:** If `--stage=implement` is set, **skip this phase except 1a (recall)** — the plan already lives in `agent_notes`. Run the recall (one cheap read — the plan may predate an Imprint a sibling Medium wrote back since), read the plan from the context payload (`agent_notes`) and the `files` list, then jump straight to Phase 2. Do not re-plan and do not re-claim.
+**Stage gate:** If `--stage=implement` is set, **skip this phase except 1a (recall) and the Sibling-sites check** — the plan already lives in `agent_notes`. Run the recall (one cheap read — the plan may predate an Imprint a sibling Medium wrote back since), fetch the plan and run the **Sibling-sites check** (apply its STOP rule on exit 3 — an orchestrated run never stops on it), read the `files` list, then jump straight to Phase 2. Do not re-plan and do not re-claim.
 
 ### 1a. Recall Imprints (memory)
 
@@ -353,13 +353,13 @@ fi
 
 Before planning, check whether `agent_notes` (read in Phase 0d) contains `<!-- plan_version:` — the sentinel left by `ghost-hunting-core:plan-haunt`.
 
-**If an existing plan is found:**
+**If an existing plan is found:** first fetch it and run the **Sibling-sites check** (below — fetch block, then check). A plan written before ghost-kit 1.11 has no section and fails the check once; the STOP rule has you add it.
 
-- **If `--autonomous`:** Use the existing plan automatically. Post EVP: "Using existing Spectral Plan. Proceeding to implementation." **Skip the rest of Phase 1, go directly to Phase 2.**
-- **If interactive:** Display the existing plan summary (complexity, confidence, file count, overview). Ask the user:
+- **If `--autonomous`:** Apply the STOP rule if the check exits 3, then use the plan. Post EVP: "Using existing Spectral Plan. Proceeding to implementation." (include the check's verdict line). **Skip the rest of Phase 1, go directly to Phase 2.**
+- **If interactive:** Display the existing plan summary (complexity, confidence, file count, overview) and the check's verdict. Ask the user (when the check exited 3, first apply the STOP rule — amend, re-run, show the amended section — and offer **Use existing plan** only once it passes):
   - **Use existing plan** — Skip the rest of Phase 1, proceed to Phase 2.
   - **Re-plan from scratch** — Clear `agent_notes` via the GET-merge-PUT pattern (set `.agent_notes = null` on the fetched payload; **never** PUT a bare `{"agent_notes": null}` — it wipes the rest of the context), then run Phase 1 normally below.
-  - **Modify** — Use the host's native planning surface when available, with the existing plan pre-loaded for editing. Otherwise revise it conversationally and wait for explicit approval. After approval, write the updated plan to context and post an EVP.
+  - **Modify** — Use the host's native planning surface when available, with the existing plan pre-loaded for editing. Otherwise revise it conversationally and wait for explicit approval. After approval, write the approved plan back into `/tmp/plan.{GHOST_ID}.md` (keep its `<!-- plan_version:` header), re-run the Sibling-sites check, then run the **PUT block** of Write plan to context and post an EVP.
 
 **If no existing plan found:** continue with Phase 1 below.
 
@@ -379,7 +379,9 @@ Before planning, check whether `agent_notes` (read in Phase 0d) contains `<!-- p
 
 3. **Design the test plan** — Plan ALL tests: backend endpoints, services, and edge cases; frontend components and hooks; e2e specs for new pages/workflows if the repo has an e2e suite. List every test file and function. If the plan adds or alters a migration that **rewrites existing row values** (a backfill/`op.execute` UPDATE, an enum canonicalization), the test plan MUST include an integration test that seeds legacy rows and drives the backfill — check the active project guidance for the repo's template and any CI lint that enforces it.
 
-4. **Write the plan** — Include specific file paths, function signatures, and test cases. When the 1a recall was non-empty, include its block verbatim under `### Recalled imprints` (omit the heading entirely when it was empty).
+4. **Sweep for siblings (every plan)** — If this ghost fixes a defect, find every other site with the same defect *shape* before writing code: grep for the **pattern** (`\.date\(\)` on a UTC instant), never just the symbol you are fixing, and name the **contract** the bug broke — the rule, and everywhere it applies (filters, "today", bucketing, display, storage) — because a sweep for copies of one line misses the places the same rule diverges in another form. Mark each site `in` (this ghost fixes it — its file joins **Files to Modify**) or `out` with a reason; group out rows by glob or directory when a broad grep returns many (`backend/seed/**` — fixtures). A class bigger than this ghost is a legal `out`: `follow-up ghost <id>` (interactive: raise it with the user first). Two or more `in` sites need a **Shared fix:** — the helper they all route through, or `inline — <why>`. Name a **Ratchet:** (the test or lint that fails if the shape comes back) or `none — <why>`. A doc that corrects a wrong statement **is** a defect fix — grep the wrong statement across every doc that restates it. A ghost that fixes no defect writes the single line `Not a defect fix` (a reason may follow it on the same line). Run the sweep from the repo root (`$WT` in worktree mode) with a relative path so sites print repo-relative — the check compares them to Files to Modify character for character. This is the section the check below enforces.
+
+5. **Write the plan** — Include specific file paths, function signatures, and test cases. When the 1a recall was non-empty, include its block verbatim under `### Recalled imprints` (omit the heading entirely when it was empty). **Run the Sibling-sites check last** — after any Adversarial-review revision, immediately before you ask for approval (interactive) or write to context (autonomous): write the plan to `/tmp/plan.{GHOST_ID}.md`, run the check, and show its verdict line with the plan (see the check's **When** for host plan modes).
 
 ### Adversarial review (interactive only, skip for `--autonomous`)
 
@@ -394,15 +396,161 @@ Append the merged review to the plan file under an `## Adversarial Review` headi
 - **Autonomous mode:** Write plan to context, post EVP, proceed to Phase 2.
 - **Interactive mode:** Exit plan mode (user sees plan + critique). After approval, write plan to context and post EVP.
 
-### Write plan to context
+### Sibling-sites check
 
-**GET-merge-PUT** (see the ⚠️ callout in Phase 0d) — write the plan markdown to a temp file, then merge it into the existing payload so `objective` / `acceptance_criteria` / `files` survive:
+Every plan carries a `### Sibling sites` section (planning step 4). This check enforces its **form** — it cannot judge whether the grep searched the shape or only the symbol; that is the staff-engineer lens's job at plan and diff review. It reads **only** the plan file, never executes the recorded grep, and decides by exit code:
+
+- **0** — ok; its one verdict line rides the plan EVP.
+- **3** — `FIX PLAN:` lines name every problem at once; apply the STOP rule below. This is **not** Phase 0's `STOP:` — it never halts an orchestrated run.
+- **4** — `CHECK NOT RUN:` the check could not run (no plan file, no credentials, `/context` failed). Fix the cause and retry; **never amend the plan for a 4**. Orchestrated and still 4 after a retry → post the warning EVP below and continue.
+
+**When:** last — after any Adversarial-review revision, immediately before you ask for approval (interactive) or write to context (autonomous); on every reused plan (1b); and at the `--stage=implement` gate. In a host plan mode that forbids writing `/tmp/plan.{GHOST_ID}.md`, point `SS_PLAN` at the host's own plan file (the check only reads it; its one write is the verdict under `/tmp`); if the host refuses the Bash call too, run it as your first action after approval — an exit 3 there is a scope change that goes back to the user before any code.
 
 ```bash
+SS_PLAN="/tmp/plan.{GHOST_ID}.md" SS_OUT="/tmp/sibling-gate.{GHOST_ID}.txt" bash <<'SSEOF'
+# ── Sibling-sites check (canonical — byte-identical in commence-haunt and plan-haunt) ──
+# Exit 0 = ok · 3 = FIX PLAN (amend what the lines name, re-run) · 4 = CHECK NOT RUN (fix the
+# cause and retry — never amend the plan for a 4). Reads ONLY $SS_PLAN; never executes the
+# recorded grep. POSIX awk reading lines with getline into a variable: no positional fields
+# for the skill harness to rewrite. Lines start "FIX PLAN:", never Phase 0's "STOP:".
+SS_OUT="${SS_OUT:-$(mktemp)}"
+if [ ! -s "${SS_PLAN:-}" ]; then
+  printf '%s\n' "CHECK NOT RUN: sibling-sites check: no plan at '${SS_PLAN:-}' — write the plan file first." > "$SS_OUT"; cat "$SS_OUT"; exit 4
+fi
+awk -v plan="$SS_PLAN" '
+function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
+function bare(s) { gsub(/[`*_]/, "", s); return trim(s) }
+function pathof(s,   i, ch) {
+  gsub(/[`*]/, "", s); s = trim(s)
+  if (match(s, /^[0-9a-fA-F]+:/) && RLENGTH >= 8 && RLENGTH <= 41) s = substr(s, RLENGTH + 1)
+  while (substr(s, 1, 2) == "./") s = substr(s, 3)
+  for (i = 1; i <= length(s); i++) {
+    ch = substr(s, i, 1)
+    if (ch == " " || ch == "\t" || ch == ":") break
+    if (ch == "#" && substr(s, i + 1, 1) == "L") break
+  }
+  return substr(s, 1, i - 1)
+}
+BEGIN {
+  P = "FIX PLAN: sibling-sites check: "
+  LIST = "^[ \t]*([-*+]|[0-9]+[.)])[ \t]+"
+  while ((getline line < plan) > 0) {
+    sub(/\r$/, "", line)
+    if (line ~ /<!-- plan_version:/) sentinel = 1
+    if (line ~ /^[ \t]*```/) { fence = !fence; continue }
+    if (fence) continue
+    if (line ~ /^(#|##|###)[ \t]/) {
+      h = tolower(line); sec = ""
+      if (h ~ /^###[ \t]+sibling sites[ \t]*$/) { sec = "sib"; nsib++ }
+      else if (h ~ /^###[ \t]+(files to modify|changes)[ \t]*$/) { sec = "files"; hasfiles = 1 }
+      continue
+    }
+    if (sec == "files") {
+      rest = line
+      # pathof() calls match() too, which resets RSTART/RLENGTH — take both before calling it.
+      while (match(rest, /`[^`]+`/)) { ms = RSTART; ml = RLENGTH; owned[pathof(substr(rest, ms, ml))] = 1; rest = substr(rest, ms + ml) }
+      if (line ~ /^[ \t]*\|/) {
+        split(line, c, "|"); cell = bare(c[2])
+        if (cell != "" && tolower(cell) != "file" && cell !~ /^[-: ]+$/) owned[pathof(c[2])] = 1
+      } else if (line ~ LIST) {
+        sub(LIST, "", line); owned[pathof(line)] = 1
+      }
+      continue
+    }
+    if (sec != "sib") continue
+    b = tolower(bare(line))
+    if (b == "") continue
+    nonblank++
+    if (b ~ /^(-[ \t]+)?not a defect fix([^a-z]|$)/) { nodefect = 1; continue }
+    if (b ~ /grep:[ \t]*[^ \t]/) grepped = 1
+    if (b ~ /^(-[ \t]+)?none([^a-z]|$)/) none = 1
+    if (b ~ /^(-[ \t]+)?shared fix:[ \t]*[^ \t]/) shared = 1
+    if (line !~ /^[ \t]*\|/) {
+      if (b !~ /^(-[ \t]+)?(contract|grep|shared fix|ratchet|none)([^a-z]|$)/) {
+        tl = line; gsub(/`[^`]*`/, "", tl)
+        if (tl ~ /\|.*\|/) bad = bad "\n" P "line \"" trim(line) "\" looks like a table row — start every row with | (a row without a leading | is not read)."
+        else if (line ~ LIST) loose = 1
+      }
+      continue
+    }
+    split(line, c, "|"); io = tolower(bare(c[3])); gsub(/[ \t]/, "", io)
+    if (bare(c[2]) ~ /^[-: ]*$/ && io ~ /^[-:]*$/) continue
+    if (io == "in/out" || tolower(bare(c[2])) == "site") continue
+    row = trim(line)
+    if (io != "in" && io != "out") { bad = bad "\n" P "row \"" row "\" — In/Out must be in or out, got \"" io "\"."; continue }
+    if (bare(c[4]) == "") bad = bad "\n" P "row \"" row "\" has no Why — every row says why it is in or out."
+    if (io == "out") { nout++; continue }
+    nin++; inrow[nin] = row; inpath[nin] = pathof(c[2])
+  }
+  close(plan)
+  pv = sentinel ? " (A plan written before ghost-kit 1.11 has none — add it.)" : ""
+  if (!nsib) { print P "the plan has no \"### Sibling sites\" section. Add one: the single line \"Not a defect fix\", or a \"Grep: <command>\" line plus a | Site | In/Out | Why | table (\"None — grep: <command>\" when the grep found nothing)." pv; exit 3 }
+  if (nsib > 1) { print P "the plan has " nsib " \"### Sibling sites\" sections — keep exactly one."; exit 3 }
+  if (nodefect) {
+    if (nonblank > 1) { print P "\"Not a defect fix\" must be the only line in the section, but it sits beside a grep or a table — pick one."; exit 3 }
+    print "sibling-sites check: ok (not a defect fix)"; exit 0
+  }
+  err = ""
+  if (!grepped) err = err "\n" P "\"### Sibling sites\" has no \"Grep: <command>\" line — record the command you searched with, or write \"Not a defect fix\"."
+  err = err bad
+  for (i = 1; i <= nin; i++) if (!(inpath[i] in owned)) { err = err "\n" P "row \"" inrow[i] "\" is in, but " inpath[i] " is not listed under ### Files to Modify — add it there (the same repo-relative path), or mark the row out with a reason."; missed = 1 }
+  if (missed && !hasfiles) err = err "\n" P "the plan has no ### Files to Modify section."
+  if (nin >= 2 && !shared) err = err "\n" P nin " sites are in and there is no \"Shared fix:\" line — name the shared helper they route through, or \"inline — <why>\"."
+  if (nin + nout == 0 && !none) err = err "\n" P "the section names no sites — list them as | Site | In/Out | Why | rows" (loose ? " (bullets are not read)" : "") ", or write \"None — grep: <command>\" when the grep found nothing."
+  if (err != "") { print substr(err, 2); exit 3 }
+  print "sibling-sites check: ok (" nin + 0 " in, " nout + 0 " out)"; exit 0
+}' > "$SS_OUT"
+SS_RC=$?
+cat "$SS_OUT"
+case "$SS_RC" in
+  0|3) exit "$SS_RC" ;;
+  *) printf '%s\n' "CHECK NOT RUN: sibling-sites check errored (awk exit $SS_RC)." | tee -a "$SS_OUT"; exit 4 ;;
+esac
+# ── End sibling-sites check ──
+SSEOF
+```
+
+**A reused plan** (1b, `--stage=implement`) lives in `agent_notes`, not in a local file. Fetch it to `/tmp/plan.{GHOST_ID}.md` first — in the **same Bash call as the Phase-0 block** (no shell state survives between Bash calls), with `{GHOST_ID}` the full UUID resolved in 0b — then run the check:
+
+```bash
+SS_OUT="/tmp/sibling-gate.{GHOST_ID}.txt"; rm -f "$SS_OUT"
+[ -n "${API_BASE:-}" ] && [ -n "${TALISMAN:-}" ] && [ -n "${GH_CLIENT:-}" ] || { printf '%s\n' "CHECK NOT RUN: API_BASE/TALISMAN/GH_CLIENT are unset in this shell — run the Phase-0 block and this block in ONE Bash call." | tee "$SS_OUT"; exit 4; }
+SS_CODE=$(curl -s --max-time 30 -o "/tmp/sibling-ctx.{GHOST_ID}.json" -w '%{http_code}' "$API_BASE/api/agent/ghosts/{GHOST_ID}/context" -H "$AUTH" -H "$GH_CLIENT")
+[ "$SS_CODE" = 200 ] || { printf '%s\n' "CHECK NOT RUN: GET /context answered HTTP $SS_CODE (401/403 = API key; 404 = ghost not in this Coven; 422 = {GHOST_ID} must be the full UUID; 000 = no connection)." | tee "$SS_OUT"; exit 4; }
+jq -r '.context_payload.agent_notes | if type == "string" then . else empty end' "/tmp/sibling-ctx.{GHOST_ID}.json" > "/tmp/plan.{GHOST_ID}.md"
+[ -s "/tmp/plan.{GHOST_ID}.md" ] || { printf '%s\n' "CHECK NOT RUN: agent_notes is empty — there is no plan to check (did the plan PUT land?)." | tee "$SS_OUT"; exit 4; }
+echo "plan fetched: $(wc -l < "/tmp/plan.{GHOST_ID}.md") lines"
+```
+
+**On exit 3 — the STOP rule.** Fix everything the `FIX PLAN:` lines name in one amendment of `/tmp/plan.{GHOST_ID}.md` (do the planning-step-4 sweep if the section is missing, and add every new `in` file to **Files to Modify**), then re-run the check. A **reused** plan is written back with the **PUT block** of Write plan to context — **never its fresh-plan template block**: the amended file *is* the plan (it keeps plan-haunt's `<!-- plan_version:` sentinel and every Spectral section).
+- **Interactive:** show the user the amended section and get explicit approval before writing it or any code — an added `in` site is a scope change.
+- **`--autonomous`:** amend, re-run, write back, and name what you added in the plan EVP (or 1b's "Using existing Spectral Plan" EVP).
+- **`--stage=implement`:** do **not** amend — the plan already passed its review gate, and an amendment here would be unreviewed scope. Post the warning EVP below and continue.
+- **Still exit 3 after two amendments:** interactive → stop and show the output; the user decides. `--autonomous` → post the warning EVP below, write back the best plan you have, and **continue** — an orchestrated run is never stopped by this check.
+
+The warning EVP (same Bash call as the Phase-0 block):
+
+```bash
+[ -n "${API_BASE:-}" ] && [ -n "${TALISMAN:-}" ] && [ -n "${GH_CLIENT:-}" ] || { echo "WARN: warning EVP not posted: API_BASE/TALISMAN/GH_CLIENT are unset — run the Phase-0 block and this block in ONE Bash call."; exit 4; }
+[ -s "/tmp/sibling-gate.{GHOST_ID}.txt" ] || printf '%s\n' "CHECK NOT RUN: no verdict was recorded." > "/tmp/sibling-gate.{GHOST_ID}.txt"
+SS_EVP=$(jq -n --rawfile g "/tmp/sibling-gate.{GHOST_ID}.txt" '{content: ("Sibling-sites check did not pass; continuing anyway (an orchestrated run never stops on this check):\n\n```\n" + $g + "```\nFix: re-run /plan-haunt {GHOST_ID} — it rewrites agent_notes with a checked plan.")}' \
+  | curl -s --max-time 30 -o "/tmp/sibling-evp.{GHOST_ID}.json" -w '%{http_code}' -X POST "$API_BASE/api/agent/ghosts/{GHOST_ID}/evps" \
+      -H "$AUTH" -H "$GH_CLIENT" -H "Content-Type: application/json" -d @-)
+case "$SS_EVP" in 2??) echo "warning EVP posted" ;; *) echo "warning EVP FAILED: HTTP $SS_EVP (on 000 after a timeout, GET /evps for this text before re-posting — an EVP POST is not idempotent)"; cat "/tmp/sibling-evp.{GHOST_ID}.json" ;; esac
+```
+
+### Write plan to context
+
+**GET-merge-PUT** (see the ⚠️ callout in Phase 0d) — write the plan markdown to a temp file, then merge it into the existing payload so `objective` / `acceptance_criteria` / `files` survive.
+
+**Fresh plan only (1c).** A reused plan (1b, Modify, `--stage=implement`) skips this template block — it already lives in `/tmp/plan.{GHOST_ID}.md`.
+
+```bash
+rm -f "/tmp/sibling-gate.{GHOST_ID}.txt"   # a verdict left by an earlier session must never ride this plan's EVP
 cat > "/tmp/plan.{GHOST_ID}.md" << 'PLANEOF'
 ## Plan
 
-### Changes
+### Files to Modify
 - [file]: [what]
 
 ### Tests
@@ -411,23 +559,50 @@ cat > "/tmp/plan.{GHOST_ID}.md" << 'PLANEOF'
 ### Approach
 [strategy]
 
+### Sibling sites
+[EITHER the single line: Not a defect fix
+ OR, for a defect fix:]
+Contract: [the rule the bug broke, and everywhere it applies]
+Grep: `[the command that searched for the defect's shape]`
+Shared fix: [helper every in-site routes through | inline — why]   (required with 2+ in rows)
+Ratchet: [test/lint that fails if the shape returns | none — why]
+| Site | In/Out | Why |
+|------|--------|-----|
+| `path/to/file.py:42` | in | [same shape] |
+| `path/to/other/**` | out | [reason, or follow-up ghost <id>] |
+
 ### Recalled imprints
 [the 1a block, verbatim — drop this heading when recall was empty]
 PLANEOF
-
-curl -s "$API_BASE/api/agent/ghosts/{GHOST_ID}/context" -H "$AUTH" -H "$GH_CLIENT" \
-  | jq '.context_payload // {}' > "/tmp/ctx.{GHOST_ID}.json"
-jq --rawfile notes "/tmp/plan.{GHOST_ID}.md" '.agent_notes = $notes' "/tmp/ctx.{GHOST_ID}.json" \
-  | curl -s -X PUT "$API_BASE/api/agent/ghosts/{GHOST_ID}/context" \
-      -H "$AUTH" -H "$GH_CLIENT" -H "Content-Type: application/json" -d @-
 ```
+
+Run the **Sibling-sites check** (above) on `/tmp/plan.{GHOST_ID}.md`, then the **PUT block** — only after the check exits 0, or orchestrated, after the STOP rule says to write back anyway. Run it in the same Bash call as the Phase-0 block:
+
+```bash
+[ -n "${API_BASE:-}" ] && [ -n "${TALISMAN:-}" ] && [ -n "${GH_CLIENT:-}" ] || { echo "NOT WRITTEN: API_BASE/TALISMAN/GH_CLIENT are unset — run the Phase-0 block and this block in ONE Bash call."; exit 4; }
+CTX_CODE=$(curl -s --max-time 30 -o "/tmp/ctx-get.{GHOST_ID}.json" -w '%{http_code}' "$API_BASE/api/agent/ghosts/{GHOST_ID}/context" -H "$AUTH" -H "$GH_CLIENT")
+[ "$CTX_CODE" = 200 ] || { echo "NOT WRITTEN: GET /context answered HTTP $CTX_CODE — a PUT now would replace the payload with agent_notes alone."; exit 4; }
+jq '.context_payload // {}' "/tmp/ctx-get.{GHOST_ID}.json" > "/tmp/ctx.{GHOST_ID}.json"
+PUT_CODE=$(jq --rawfile notes "/tmp/plan.{GHOST_ID}.md" '.agent_notes = $notes' "/tmp/ctx.{GHOST_ID}.json" \
+  | curl -s --max-time 30 -o "/tmp/ctx-put.{GHOST_ID}.json" -w '%{http_code}' -X PUT "$API_BASE/api/agent/ghosts/{GHOST_ID}/context" \
+      -H "$AUTH" -H "$GH_CLIENT" -H "Content-Type: application/json" -d @-)
+case "$PUT_CODE" in 2??) echo "plan written to agent_notes" ;; *) echo "NOT WRITTEN: plan PUT answered HTTP $PUT_CODE:"; cat "/tmp/ctx-put.{GHOST_ID}.json"; exit 4 ;; esac
+```
+
+**`NOT WRITTEN` (exit 4):** fix the cause (Phase 0 in the same call, then a retry) and re-run this block. A **fresh** plan that still cannot be written is a real stop — there is nothing for Phase 2 to read. A **reused** plan under `--autonomous` that still cannot be written back: continue — the plan already in `agent_notes` stands — and say so in the next EVP.
 
 ### Post short "Plan" EVP
 
+The check's verdict line **and** the Sibling sites section ride **every** plan EVP — an unattended `Not a defect fix` claim stays visible, and the out rows (their why, any follow-up ids) stay on record after 4b replaces `agent_notes`. Same Bash call as the Phase-0 block:
+
 ```bash
-curl -s -X POST "$API_BASE/api/agent/ghosts/{GHOST_ID}/evps" \
-  -H "$AUTH" -H "$GH_CLIENT" -H "Content-Type: application/json" \
-  -d '{"content": "Plan finalized. X backend files, Y frontend files, Z tests planned. Beginning implementation."}'
+[ -n "${API_BASE:-}" ] && [ -n "${TALISMAN:-}" ] && [ -n "${GH_CLIENT:-}" ] || { echo "NOT POSTED: API_BASE/TALISMAN/GH_CLIENT are unset — run the Phase-0 block and this block in ONE Bash call."; exit 4; }
+[ -s "/tmp/sibling-gate.{GHOST_ID}.txt" ] || { echo "CHECK NOT RUN: no Sibling-sites verdict for this plan — run the check, then this block."; exit 4; }
+awk '/^###[ \t]+[Ss]ibling [Ss]ites[ \t]*$/ { p = 1; print; next } /^(#|##|###)[ \t]/ { p = 0 } p' "/tmp/plan.{GHOST_ID}.md" > "/tmp/sibling-section.{GHOST_ID}.md"
+PLAN_EVP=$(jq -n --rawfile g "/tmp/sibling-gate.{GHOST_ID}.txt" --rawfile s "/tmp/sibling-section.{GHOST_ID}.md" '{content: ("Plan finalized. X backend files, Y frontend files, Z tests planned. " + ($g | rtrimstr("\n")) + ". Beginning implementation.\n\n" + $s)}' \
+  | curl -s --max-time 30 -o "/tmp/plan-evp.{GHOST_ID}.json" -w '%{http_code}' -X POST "$API_BASE/api/agent/ghosts/{GHOST_ID}/evps" \
+      -H "$AUTH" -H "$GH_CLIENT" -H "Content-Type: application/json" -d @-)
+case "$PLAN_EVP" in 2??) echo "plan EVP posted" ;; *) echo "plan EVP FAILED: HTTP $PLAN_EVP"; cat "/tmp/plan-evp.{GHOST_ID}.json" ;; esac
 ```
 
 > **CHECKPOINT — Phase 1 complete.** Proceed to Phase 2.

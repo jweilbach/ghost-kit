@@ -93,7 +93,7 @@ case "$KEY_SRC" in "$REPO_ROOT"/*) KEY_SHOW="./${KEY_SRC#"$REPO_ROOT"/}" ;; "$HO
 # scripts/ghost-kit-release.sh. Deliberately NOT read from disk: a session loads skill
 # text once at start and holds it, so a runtime read reports what is on disk NOW, not
 # what is running. That is how a session executing v1.3.7 reported plugin/1.4.0.
-PLUGIN_VERSION="1.10.0"
+PLUGIN_VERSION="1.11.0"
 GK_ROOT="${GHOST_KIT_ROOT:-${CLAUDE_PLUGIN_ROOT:-${PLUGIN_ROOT:-}}}"
 [ -z "$GK_ROOT" ] && [ -x "$REPO_ROOT/.ghost/bin/resolve-plugin" ] && GK_ROOT=$("$REPO_ROOT/.ghost/bin/resolve-plugin" 2>/dev/null)
 GK_SRC=$(jq -r '.["ghost-kit"].installLocation // empty' "$HOME/.claude/plugins/known_marketplaces.json" 2>/dev/null)
@@ -233,7 +233,7 @@ disjoint-file waves → plan-time guards (base SHA, slug) → **dry_run via the 
 rite-cadence `validatePlan`** → proportional `ghost-hunting-core:panel` review →
 user-approved wave table.
 
-**Exit condition:** dry_run returned `status:"validated"` with zero issues AND
+**Exit condition:** dry_run returned `status:"validated"` with zero issues, `sibling_sites:"checked"` and an empty `sibling_issues` AND
 the P1b anchor check exited 0 on the final plan AND the P1c imprint check
 exited 0 AND panel findings addressed AND
 the user approved the wave table. Then **fall
@@ -254,7 +254,8 @@ persist a `last-error:` digest into its description.
 3. Never a second ritual for a rite — draft → resume it; consecrated → nothing to
    forge (or the delta re-forge); entombed → surface and ask.
 4. No waves reach Forge without a `status:"validated"` dry_run **in this
-   session** — including hand-authored waves and resumed drafts.
+   session** whose `sibling_issues` is empty (and `sibling_sites` is `"checked"`) —
+   including hand-authored waves and resumed drafts.
 5. This skill never calls any `/invocations` endpoint. Ever.
 6. Human gates over existing ghosts use `spawn_ghost: false` (never mint
    duplicates at run time).
@@ -294,6 +295,7 @@ persist a `last-error:` digest into its description.
 | Rite empty / all ghosts exorcised | Offer Gather-attach or report done |
 | ALL ghosts routed out at P2 | Refuse entirely; no ritual; report every reason |
 | dry_run `invalid` | Iterate the plan; Forge is unreachable until `validated` |
+| dry_run `sibling_issues` non-empty, or no `sibling_sites` key | Fix each named ghost's `sibling_sites` (planning.md P1b step 5, P3); no key = the vendored engine predates R8 — `/ghost-sync`, commit, re-run P5 |
 | `args` > 32KB / prep instructions > 10k | Externalize (contract_path / Scroll) → split run nodes; never trim implementer prompts |
 | POST ritual name collision (coven-unique, verified) | Suffix ` (2)`, retry once; then ask |
 | validate errors / consecrate 400 | Node-anchored fix loop, cap 3 → leave draft + `last-error:` digest in its description + resume hint |

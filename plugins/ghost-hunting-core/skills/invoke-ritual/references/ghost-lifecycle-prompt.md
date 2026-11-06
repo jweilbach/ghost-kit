@@ -124,7 +124,13 @@ with ≥1 other file-touching sibling; sequential main-tree otherwise.
 > recall never blocks the work.
 >
 > ## 2. Post starting EVP, plan, implement
-> Post a starting EVP (field is `content`). Plan in your thinking. Implement
+> Post a starting EVP (field is `content`). Plan in your thinking. If this ghost
+> fixes a defect, grep the defect's SHAPE (the pattern, not the fixed symbol),
+> fix every sibling site with the same shape — through one shared helper when
+> there are several — and record the result in the completion EVP's one-line
+> `Sibling sites:` clause (§6). In a parallel wave (you were given a worktree),
+> fix siblings only inside this ghost's context `files`; list every other one as
+> left — `another step may own it`. Implement
 > following the host repo's conventions (its CLAUDE.md){IMPLEMENT_NOTES}.
 > Ghost Hunting API JSON fields use standard names (`project_id`, not
 > `haunting_id`).
@@ -200,7 +206,7 @@ with ≥1 other file-touching sibling; sequential main-tree otherwise.
 >   -d '{"content": "Files changed: [...]. Tests: [...] passing."}'
 > curl -s -X POST "{API_BASE}/api/agent/ghosts/{GHOST_ID}/evps" \
 >   -H "Authorization: Bearer {TALISMAN}" -H "{GH_CLIENT}" -H "Content-Type: application/json" \
->   -d '{"content": "Implementation complete. [summary]. Imprints: <N recorded (<ids>) | replayed (<ids>) | none — <reason> | failed: HTTP <code>>."}'
+>   -d '{"content": "Implementation complete. [summary]. Sibling sites: <not a defect fix | fixed <site>, <site>; left <site> — <why>>. Imprints: <N recorded (<ids>) | replayed (<ids>) | none — <reason> | failed: HTTP <code>>."}'
 > ```
 > {EXORCISE_INSTRUCTION}
 >

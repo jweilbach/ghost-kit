@@ -81,7 +81,7 @@ case "$KEY_SRC" in "$REPO_ROOT"/*) KEY_SHOW="./${KEY_SRC#"$REPO_ROOT"/}" ;; "$HO
 # scripts/ghost-kit-release.sh. Deliberately NOT read from disk: a session loads skill
 # text once at start and holds it, so a runtime read reports what is on disk NOW, not
 # what is running. That is how a session executing v1.3.7 reported plugin/1.4.0.
-PLUGIN_VERSION="1.10.0"
+PLUGIN_VERSION="1.11.0"
 GK_ROOT="${GHOST_KIT_ROOT:-${CLAUDE_PLUGIN_ROOT:-${PLUGIN_ROOT:-}}}"
 [ -z "$GK_ROOT" ] && [ -x "$REPO_ROOT/.ghost/bin/resolve-plugin" ] && GK_ROOT=$("$REPO_ROOT/.ghost/bin/resolve-plugin" 2>/dev/null)
 GK_SRC=$(jq -r '.["ghost-kit"].installLocation // empty' "$HOME/.claude/plugins/known_marketplaces.json" 2>/dev/null)

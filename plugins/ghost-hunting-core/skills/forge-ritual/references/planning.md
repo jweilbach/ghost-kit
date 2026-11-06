@@ -80,7 +80,25 @@ before P2, for **every** ghost:
    Gather-born errors do not get transcribed into waves.
 5. Every projection, allowlist, action→event map, or test file the anchors reveal
    **joins that wave's owned files** — that is where the "13 filters silently
-   dropped" class of miss lives.
+   dropped" class of miss lives. **The same rule for a bug-fix ghost's siblings**
+   (Sunpath #518 fixed one `.date()`-on-a-UTC-instant filter and left 11): grep the
+   defect's *shape* at `PLAN_SHA` (the pattern, never just the fixed symbol), name the
+   *contract* the bug broke and everywhere it applies, and record the result as the
+   ghost entry's `sibling_sites` (P3). Write each `site` as `<repo-relative path>[:<line
+   at PLAN_SHA>]` — drop `git grep`'s leading `<sha>:`. Every `in` site's file joins
+   **both** the `files` of the implementer that edits it (the engine writes the site into
+   that implementer's build prompt) **and** a ghost entry's `files` — commits are staged
+   per ghost from `ghosts[].files`, so an implementer-only path is swept under the primary
+   ghost and flagged. If that file already belongs to another ghost of the wave it stays
+   there and the sibling fix commits under that ghost; say so in the row's `why`
+   (`commits under <id8>`). When `in` sites span two implementers, `shared_fix` names the
+   helper's exact signature and file; the implementer that owns that file creates it, every
+   other one only calls it (they build in parallel and cannot read each other's edits), and
+   both `prompt`s say so. A site another wave fixes is `out` with why `fixed in wave <name>`
+   — that wave must carry it as an `in` row, which the engine checks; a class bigger than
+   the rite is `out` with `follow-up ghost <id>`. A doc that corrects a wrong statement is a
+   defect fix too (its siblings are the other docs that restate it). An `in` site on a
+   backend path can flip the wave to `backend: true` — re-run P2 to fixpoint.
 6. **Readers of every changed contract, not just its callers.** Step 5 finds the
    files; this finds the values. For each contract a wave changes — a response
    shape, a return type, an event payload, a cache/placeholder behavior — enumerate
@@ -316,7 +334,15 @@ usually force this anyway — make it explicit regardless).
 - Waves need: unique `name` (kebab, short); `primary_ghost_id` ∈ the wave's ghost
   ids (it absorbs reconcile-sweep, runtime-detected migration, and harden
   commits); per ghost `{id, files, title, commit_message, commit_body:
-  "Ghost: <uuid>"}`; per implementer `{label, files, prompt}` — the prompt is the
+  "Ghost: <uuid>", sibling_sites}` — `sibling_sites` is REQUIRED on EVERY ghost entry:
+  `"not a defect fix"` for features, new docs and refactors (a doc that corrects a wrong
+  statement IS a defect fix), or for a defect fix
+  `{contract?, grep, shared_fix, ratchet?, rows: [{site, in_out: "in"|"out", why}]}`
+  (`rows: []` when the grep found nothing; `shared_fix` required with two or more `in`
+  rows — the helper every in site routes through, or `inline — <why>`; `ratchet` names
+  the test or lint that fails if the shape returns, or `none — <why>`; keep each `why`
+  ≤100 chars — sibling tables count toward the 32 KB run-node args cap). Every `in`
+  site must be in one of the wave's implementers' `files` and a ghost's `files`. Per implementer `{label, files, prompt}` — the prompt is the
   full task spec (contract sections, behaviors, test expectations,
   edit-ONLY-these-files); non-empty `gate_cmds`. Use the repo's own test commands
   from `.ghost/config.json` (`.tests.frontend` / `.tests.backend`). House
@@ -555,11 +581,19 @@ Workflow({
 })
 ```
 
-Expect `{status: "validated", issues: [], sequence: [...]}`. Print the `sequence`
+Expect `{status: "validated", issues: [], sibling_sites: "checked", sibling_issues: [], sequence: [...]}`. Print the `sequence`
 lines to the user (backend/migration waves are tagged). Any `issues` → fix the
 plan and re-run. **Forge is unreachable while `status` is `"invalid"`** — no
 exceptions, including user-supplied wave plans and resumed drafts (re-validate
-them in-session).
+them in-session). **Forge is equally unreachable while `sibling_issues` is
+non-empty** — fix each named ghost's `sibling_sites` (P1b step 5, P3) and re-run.
+This is the ONE place **in a forged rite** the sibling check is a hard gate (interactive
+plan approval is the other, on the single-ghost path): at run time the engine reports the
+same issues as warnings and never stops a ritual over them, so a plan consecrated with them
+would simply run with the siblings unfixed. `sibling_issues` is computed only once `issues`
+is empty — an `invalid` result reports `sibling_sites: "skipped"`, so fix `issues` first. A
+result with **no `sibling_sites` key** means the vendored engine predates R8 and checked
+nothing — run `/ghost-sync`, commit, and re-run P5.
 
 ## P6 — Adversarial panel (proportional)
 

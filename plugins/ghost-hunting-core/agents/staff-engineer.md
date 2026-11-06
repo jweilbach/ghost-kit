@@ -68,6 +68,20 @@ tests).
   object (a stale `total` or count, not just stale rows). A reshaped or stale
   value that feeds a destructive confirm, a cap check, or a mutation payload
   is a `blocker`.
+- **Siblings of a fixed defect.** When a plan or diff fixes a bug, grep for
+  the defect's *shape* (the pattern), not the fixed symbol, across the repo —
+  and name the *contract* the bug broke (the rule, and every place it
+  applies): a sweep for copies of one line misses the places the same rule
+  diverges in a different form. Report each unfixed sibling as a `concern`
+  (a `blocker` if users hit it) against the plan or PR; never widen a fix's
+  scope to reach one yourself. Two or more sites patched inline where one
+  shared helper could own the behaviour is a Reuse/DRY finding. A plan or
+  diff that fixes a defect while its `### Sibling sites` section says `Not a
+  defect fix` is a `concern`. A recurring shape with no ratchet (a test or
+  lint that fails if it comes back) is a `nitpick` worth naming. When you are
+  HARDENING a committed range and your prompt carries a `SIBLING SITES RULED
+  AT PLAN TIME` block, follow it: an `out` row is a ruled decision, never a
+  finding, and siblings outside the range are out of scope there.
 - **Observability.** Can someone debug this in production from the logs (and
   the repo's audit/activity trail, if it has one) alone? Are failures
   swallowed silently?

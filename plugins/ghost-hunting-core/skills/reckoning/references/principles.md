@@ -39,6 +39,7 @@ including empty, boundary and error cases.
 - a state transition the domain forbids is reachable, or a required transition is unreachable
 - time and money bugs: naive and aware datetimes mixed, a date-only string parsed as UTC midnight, floats used for money
 - two paths for one operation disagree, e.g. the bulk path skips validation the single path runs
+- one defect shape at several sites while a sibling already carries the fix (e.g. one date filter converts to the org's day and eleven still call `.date()` on a UTC instant): report EVERY unfixed sibling, not just the first, and name the shared fix the converted site points to
 - a type or identity mismatch (a string compared to a UUID), a mutable default argument, a shadowed variable
 
 **Not a violation**

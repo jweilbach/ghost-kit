@@ -7,7 +7,8 @@
     "A migration-producing wave is flagged migration:true and has EXACTLY ONE implementer. NEVER declare paths under a migrations versions/ directory (e.g. backend/migrations/versions/ or backend/alembic/versions/) — revision numbers depend on the live head; the runner detects the generated file at runtime, commits it under the primary ghost, and (when isolation.db_migrate is set) proves reversibility (downgrade to the pre-wave head → upgrade → drift gate) post-commit.",
     "gate_cmds run from the worktree root and are repo-specific (use your repo's test commands from .ghost/config.json — .tests.frontend / .tests.backend). Frontend waves: frontend/byte-gate only. Backend waves: DATABASE_URL={{db_url}} TIMEOUT_SECS=1500 <tests.backend> (the pytest suite is often hermetic sqlite — the scratch DB is for migrate/seed/pg-smoke) plus targeted ruff.",
     "primary_ghost_id must be one of the wave's ghost ids; harden/reconcile sweep, runtime-detected migration, and harden-fix commits are attributed to it.",
-    "stop_before / resume_from name a wave; use them for approval gates (e.g. stop_before a J1 wave). Resume payloads carry baseline_red — pass it back via args.baseline_red to skip re-deriving the baseline."
+    "stop_before / resume_from name a wave; use them for approval gates (e.g. stop_before a J1 wave). Resume payloads carry baseline_red — pass it back via args.baseline_red to skip re-deriving the baseline.",
+    "Every ghost entry carries sibling_sites (R8, ghost-kit 1.11): \"not a defect fix\" for features, docs and refactors; a defect fix records {contract?, grep, shared_fix (required with 2+ in rows), ratchet?, rows: [{site, in_out: \"in\"|\"out\", why}]} — rows: [] when the grep found nothing. Every in site must be in one of the wave's implementers' files (the engine writes it into that implementer's build prompt). dry_run reports violations as sibling_issues and forge refuses to consecrate until it is empty; a real run NEVER stops on them — they become warnings."
   ],
   "_backend_wave_example": {
     "name": "creature-substrate",
@@ -24,7 +25,8 @@
           "backend/tests/test_field_schema.py"
         ],
         "commit_message": "Creature substrate: seed migration + species registry + resolver",
-        "commit_body": "Ghost: __GHOST_ID_SUBSTRATE__"
+        "commit_body": "Ghost: __GHOST_ID_SUBSTRATE__",
+        "sibling_sites": "not a defect fix"
       }
     ],
     "implementers": [
@@ -75,7 +77,8 @@
             "frontend/src/pages/World.test.jsx"
           ],
           "commit_message": "Overworld V2-D: warp + world map — road-sign travel, WorldMap panel, per-city play",
-          "commit_body": "Road-sign Travel buttons (advance key never travels), WorldMap ow-panel (all cities, grayed empties, growth badges), per-city play + warp choreography, deep-link + failure resilience. Bridge events warp:begin/world:warp/warp:cancel."
+          "commit_body": "Road-sign Travel buttons (advance key never travels), WorldMap ow-panel (all cities, grayed empties, growth badges), per-city play + warp choreography, deep-link + failure resilience. Bridge events warp:begin/world:warp/warp:cancel.",
+          "sibling_sites": "not a defect fix"
         },
         {
           "id": "__GHOST_ID_RESIDENCES__",
@@ -101,7 +104,30 @@
             "frontend/src/game/worldgen/templates/template.schema.json"
           ],
           "commit_message": "Overworld V2-I: residences — lives_in persons claim houses",
-          "commit_body": "ca-suburb templateVersion 2: 6 house anchor lots, lives_in-only claims, composed house kit (zero new art cells), door dialogue via houseSign.js. Carries D's road-sign edits in the shared generateDialogue.js."
+          "commit_body": "ca-suburb templateVersion 2: 6 house anchor lots, lives_in-only claims, composed house kit (zero new art cells), door dialogue via houseSign.js. Carries D's road-sign edits in the shared generateDialogue.js.",
+          "sibling_sites": {
+            "contract": "a lot is assigned to exactly one building template (no double-assignment, no empty lot)",
+            "grep": "rg -n \"assignLot|lots\\[\" frontend/src/game/worldgen",
+            "shared_fix": "frontend/src/game/worldgen/assignLots.js — every caller routes through assignLots()",
+            "ratchet": "frontend/src/game/worldgen/generateWorld.test.js asserts every lot is assigned exactly once",
+            "rows": [
+              {
+                "site": "frontend/src/game/worldgen/assignLots.js:41",
+                "in_out": "in",
+                "why": "the double-assignment this ghost fixes"
+              },
+              {
+                "site": "frontend/src/game/worldgen/placeNpcs.js:88",
+                "in_out": "in",
+                "why": "same lot lookup, same off-by-one"
+              },
+              {
+                "site": "frontend/scripts/worldgen/**",
+                "in_out": "out",
+                "why": "offline render tooling, not the game path"
+              }
+            ]
+          }
         }
       ],
       "implementers": [

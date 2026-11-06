@@ -141,8 +141,9 @@ If push or PR creation fails: data.ok=false with the error in summary.
 
 - **F0 (draft resume only):** `GET /api/agent/rituals/{draft_id}` → extract
   `waves` from the run node's `config.args` → re-run the P5 dry_run locally →
-  compare `planned_ghost_ids` vs the rite's CURRENT unexorcised ghosts. Mismatch
-  or `invalid` → offer `--replan`; else continue at F2.
+  compare `planned_ghost_ids` vs the rite's CURRENT unexorcised ghosts. Mismatch,
+  `invalid`, a non-empty `sibling_issues` or no `sibling_sites` key (a pre-R8 draft)
+  → offer `--replan`; else continue at F2.
 - **F1 Compose + persist:** fill the template; run the §1 size asserts;
   `POST $API_BASE/api/agent/covens/$ORG_ID/rituals` with
   `{"name": "<rite name> forge", "description": "rite:<rite_id> — forged by /forge-ritual <YYYY-MM-DD>; autonomous", "definition": {...}}`.
