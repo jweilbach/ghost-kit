@@ -36,7 +36,7 @@ shell, so use the printed path, not `$GK`).
 
 ```bash
 # ── ghost-onboard bootstrap (runs before any credential exists; NOT the canonical Phase 0) ──
-PLUGIN_VERSION="1.11.0"
+PLUGIN_VERSION="1.12.0"
 GK="${CLAUDE_PLUGIN_ROOT}/scripts/ghost-kit"
 if [ ! -x "$GK" ]; then
   REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd)

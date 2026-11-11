@@ -168,9 +168,19 @@
       "properties": {
         "vendor": {
           "type": "array",
-          "items": { "enum": ["ghost-lane", "extermination", "rite-cadence", "harden", "reckoning"] },
-          "description": "Which workflow templates /ghost-sync renders into .claude/workflows/. Empty array = none. Primary path: rite-cadence (engine, frontend AND backend/migration waves) with harden as its child, authored via forge-ritual and run via invoke-ritual. ghost-lane and extermination are DEPRECATED (sunsetting) — kept only for ad-hoc ghost sets outside a forged rite. reckoning is the /reckoning audit engine (one Part per run); vendor it only in repos that run reckonings."
+          "items": { "enum": ["ghost-lane", "extermination", "rite-cadence", "harden", "reckoning", "validate"] },
+          "description": "Which workflow templates /ghost-sync renders into .claude/workflows/. Empty array = none. Primary path: rite-cadence (engine, frontend AND backend/migration waves) with harden as its child, authored via forge-ritual and run via invoke-ritual. ghost-lane and extermination are DEPRECATED (sunsetting) — kept only for ad-hoc ghost sets outside a forged rite. reckoning is the /reckoning audit engine (one Part per run); vendor it only in repos that run reckonings. validate is the /validate-haunt engine (a read-only check of one PR against its ghost and wisps)."
         }
+      }
+    },
+    "validate": {
+      "type": "object",
+      "description": "/validate-haunt settings. Absent = the check reads only each ghost's and wisp's own written spec.",
+      "properties": {
+        "rules": { "type": "array", "items": { "type": "string" }, "description": "Repo-relative rule files (e.g. .ghost/tenets.md) an extra Opus pass checks the PR's changed lines against; a rule's blocker is a must-fix. Absent = no rules pass." },
+        "wording": { "type": "boolean", "default": false, "description": "The repo's owner approves user-visible copy: the judge checks the PR body's wording list line by line against the code (matches / differs / not found) and lists the sentences the diff adds that the list leaves out. Information for the owner, never a must-fix by itself." },
+        "judges": { "type": "integer", "minimum": 1, "maximum": 3, "default": 1, "description": "How many Opus judges share a round-1 check, each owning a share of the units and all seeing the whole PR. One is the cheapest; two take about a minute less on a 9-to-13-unit ghost and cost roughly half as much again. Never more judges than units. Round 2 always uses one." },
+        "effort": { "enum": ["xhigh", "high"], "default": "xhigh", "description": "The judges' reasoning effort. high takes about half the time and found the same gaps in testing, but graded one borderline acceptance criterion a note where xhigh called it a must-fix." }
       }
     },
     "reckoning": {

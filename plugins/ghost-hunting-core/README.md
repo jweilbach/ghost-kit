@@ -243,7 +243,7 @@ vendors the canonical `pg-smoke.sh` when a repo sets `.isolation.pg_smoke`.
 
 ghost-onboard · haunt · summon · seance · commence-haunt · plan-haunt · review-haunt ·
 merge-haunt · haunt-triage · investigate · panel · forge-ritual · invoke-ritual ·
-haunt-status · ghost-fleet · reckoning · batch-haunt (deprecated stub → forge-ritual/invoke-ritual) ·
+haunt-status · ghost-fleet · reckoning · validate-haunt · batch-haunt (deprecated stub → forge-ritual/invoke-ritual) ·
 ghost-sync
 
 (The legacy patrol system was retired when ghost-kit was created — batch
