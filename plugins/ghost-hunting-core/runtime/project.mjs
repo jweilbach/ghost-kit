@@ -15,8 +15,9 @@ const parseYaml = (text) => (yamlParse ||= require('yaml').parse)(text);
 export const pluginRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 export const version = JSON.parse(readFileSync(join(pluginRoot, '.claude-plugin/plugin.json'))).version;
 export const modelDefaults = { fable: 'gpt-6-astra', opus: 'gpt-5.6-sol', sonnet: 'gpt-5.6-terra' };
+// maxBuffer: Node's 1 MB default kills a large PR diff with ENOBUFS (validate-prep writes whole diffs).
 export function git(cwd, ...args) {
-  return execFileSync('git', ['-C', cwd, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+  return execFileSync('git', ['-C', cwd, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 256 << 20 }).trim();
 }
 export function project(cwd = process.cwd()) {
   const root = git(resolve(cwd), 'rev-parse', '--show-toplevel');

@@ -598,7 +598,21 @@ export function writeLook(run, tree) {
   return file;
 }
 
+// One owner for a failed prep's cleanup: any throw after the PR is pinned (fail() included)
+// removes the pinned tree and its ref. pruneOld never reclaims a ref whose tree is gone.
 async function prep(v) {
+  const undo = [];
+  try {
+    return await prepRun(v, undo);
+  } catch (e) {
+    for (const f of undo.reverse()) {
+      try { f(); } catch { /* already gone */ }
+    }
+    throw e;
+  }
+}
+
+async function prepRun(v, undo) {
   const startedAt = new Date().toISOString();
   const cwd = resolve(v.cwd || process.cwd());
   const p = project(cwd);
@@ -679,15 +693,13 @@ async function prep(v) {
   const RUN_ID = `${stamp}-${id8(ghostId)}-pr${prNum}-r${round}`;
   const REF = `refs/ghost-validate/${RUN_ID}`;
   const fetchHead = () => git(MAIN, 'fetch', '-q', 'origin', `+refs/heads/${pr.baseRefName}:refs/remotes/origin/${pr.baseRefName}`, `+refs/pull/${prNum}/head:${REF}`);
+  undo.push(() => git(MAIN, 'update-ref', '-d', REF));
   fetchHead();
   if (git(MAIN, 'rev-parse', REF) !== pr.headRefOid) {
     pr = viewPr();
     fetchHead();
     if (git(MAIN, 'rev-parse', REF) !== pr.headRefOid) fail(`PR #${prNum}'s head is moving (pushes in progress): run again in a minute`);
   }
-  const cleanupRef = () => {
-    try { git(MAIN, 'update-ref', '-d', REF); } catch { /* already gone */ }
-  };
   // --at <sha>: validate the PR as it stood at an earlier commit of its own (to compare with an
   // earlier check). It must be on the PR's history, never some other branch.
   let head = pr.headRefOid;
@@ -697,7 +709,6 @@ async function prep(v) {
       at = git(MAIN, 'rev-parse', '--verify', '-q', `${v.at}^{commit}`);
       execFileSync('git', ['-C', MAIN, 'merge-base', '--is-ancestor', at, head], { stdio: 'ignore' });
     } catch {
-      cleanupRef();
       fail(`--at ${v.at} is not a commit on PR #${prNum}'s history`);
     }
     if (at !== head) warnings.push(`validating PR #${prNum} as it was at ${at.slice(0, 8)}, not its current head ${head.slice(0, 8)}`);
@@ -713,7 +724,6 @@ async function prep(v) {
       base = git(MAIN, 'merge-base', ref, head);
     } else base = git(MAIN, 'merge-base', `refs/remotes/origin/${pr.baseRefName}`, head);
   } catch (e) {
-    cleanupRef();
     fail(`cannot find a base for PR #${prNum}: ${String(e.message || e).split('\n')[0]}`);
   }
   const commits = git(MAIN, 'log', '--reverse', '--format=%H%x1f%s', `${base}..${head}`).split('\n').filter(Boolean).map((l) => {
@@ -721,7 +731,6 @@ async function prep(v) {
     return { sha, subject };
   });
   if (!commits.length) {
-    cleanupRef();
     fail(`PR #${prNum} has no commits beyond its base ${base.slice(0, 8)} (already merged?): nothing to validate`, 3);
   }
   if (!v.base) {
@@ -760,7 +769,6 @@ async function prep(v) {
     }
     const st = stackedBase(commits.map((c) => ({ sha: c.sha, foreign: foreign.has(c.sha) })));
     if (st.stacked && !st.all_foreign) {
-      cleanupRef();
       fail(`PR #${prNum} starts with ${st.count} commit(s) that belong to another PR (a stacked PR). Re-run with --base ${st.base} so the parent's work is not judged as this PR's.`, 5, { suggested_base: st.base, parent_commits: commits.slice(0, st.count).map((c) => `${c.sha.slice(0, 8)} ${c.subject}`) });
     }
     if (st.all_foreign) warnings.push(`every commit in PR #${prNum} also belongs to another open PR: check the base`);
@@ -770,7 +778,6 @@ async function prep(v) {
   // ── units: the ghost and every wisp, each fetched in full (/wisps rows carry no payload) ──
   const ghost = await api.must(`/api/agent/ghosts/${ghostId}`, null);
   if (!ghost) {
-    cleanupRef();
     fail(`could not read ghost ${ghostId}`, 7, { errors: api.errors });
   }
   if (ghost.parent_task_id) warnings.push(`${id8(ghostId)} is a wisp of ${id8(ghost.parent_task_id)}: validating this wisp alone (pass the parent to check every wisp)`);
@@ -779,7 +786,6 @@ async function prep(v) {
   const unitGhosts = [ghost, ...wisps.filter(Boolean)];
   const evpLists = await pmap(unitGhosts, 6, (g) => api.must(`/api/agent/ghosts/${g.id}/evps`, []));
   if (api.errors.length) {
-    cleanupRef();
     fail('Ghost Hunting API calls failed after retries: a bundle with holes would read missing EVPs or wisps as facts', 7, { errors: api.errors.slice(0, 40) });
   }
 
@@ -808,7 +814,6 @@ async function prep(v) {
     } catch { /* rewritten */ }
     if (!onHistory) warnings.push(`the PR was rewritten since round ${round - 1} (${String(prev.final.head).slice(0, 8)} is no longer on its history): a full re-run`);
     else if (prev.final.head === head) {
-      cleanupRef();
       fail(`PR #${prNum} has not moved since round ${round - 1} (head ${head.slice(0, 8)}): nothing new to check`, 3);
     } else if (!arr(prev.final.must_fix).length) warnings.push(`round ${round - 1} had no must-fix items: a full re-run`);
     else recheckOf = prev;
@@ -871,7 +876,6 @@ async function prep(v) {
   const estimate = { mode, judge: judges, rules: rules.length ? 1 : 0, reader: v['double-check'] ? 1 : 0 };
   estimate.total = estimate.judge + estimate.rules + estimate.reader;
   if (estimate.total > MAX_AGENTS || units.length > JUDGE_UNITS) {
-    cleanupRef();
     fail(`${units.length} units is more than one judge reads well (${JUDGE_UNITS}): check the wisps one at a time by passing a wisp id`, 3, { estimate });
   }
 
@@ -880,6 +884,7 @@ async function prep(v) {
   if (!existsSync(join(valRoot, '.gitignore'))) writeFileSync(join(valRoot, '.gitignore'), '*\n');
   const TREE = join(RUN, 'tree');
   git(MAIN, 'worktree', 'add', '-q', '--detach', TREE, head);
+  undo.push(() => git(MAIN, 'worktree', 'remove', '--force', TREE));
   const baseline = dirty(TREE);
   const ruleFiles = [];
   for (const r of rules) {
@@ -946,8 +951,6 @@ async function prep(v) {
   writeFileSync(join(BUNDLE, 'pack.md'), pack.text + '\n');
   const engine = v.engine ? resolve(v.engine) : join(MAIN, '.claude', 'workflows', 'validate.js');
   if (!existsSync(engine)) {
-    git(MAIN, 'worktree', 'remove', '--force', TREE);
-    cleanupRef();
     fail(`${engine} is missing: add "validate" to .ghost/config.json workflows.vendor, run ghost-hunting-core:ghost-sync, commit`);
   }
   const args = {

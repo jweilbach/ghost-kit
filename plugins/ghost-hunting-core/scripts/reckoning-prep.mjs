@@ -450,7 +450,7 @@ async function init(values) {
   let originRepo = '';
   try { originRepo = git(tree, 'remote', 'get-url', 'origin').replace(/\.git$/, '').split(/[/:]/).slice(-2).join('/').toLowerCase(); } catch {}
   const idx = scopeGhosts.length ? execFileSync('git', ['-C', tree, 'log', '--format=%H%x1f%cI%x1f%s%x1f%b%x1e'], { encoding: 'utf8', maxBuffer: 256 * 1024 * 1024 }).split('\x1e').map((r) => r.trim()).filter(Boolean).map((r) => { const [sha, at, subject, body] = r.split('\x1f'); return { sha, at: Date.parse(at), subject, body: body || '' }; }) : [];
-  const filesOf = (sha) => execFileSync('git', ['-C', tree, 'show', '--name-only', '--format=', sha], { encoding: 'utf8' }).split('\n').filter(Boolean);
+  const filesOf = (sha) => execFileSync('git', ['-C', tree, 'show', '--name-only', '--format=', sha], { encoding: 'utf8', maxBuffer: 256 << 20 }).split('\n').filter(Boolean);
   const detail = await pmap(scopeGhosts, 8, async (g) => {
     const [evps, prs] = await Promise.all([must(`/api/agent/ghosts/${g.id}/evps`, []), must(`/api/agent/ghosts/${g.id}/apparitions`, [])]);
     const prFiles = new Set();
