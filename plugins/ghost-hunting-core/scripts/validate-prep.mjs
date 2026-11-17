@@ -568,22 +568,27 @@ function look(argv) {
 const ghRun = (cwd, args) => execFileSync('gh', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 256 << 20 });
 const ghJSON = (cwd, args) => JSON.parse(ghRun(cwd, args) || 'null');
 
-function pruneOld(main, warnings) {
+// A finished or day-old run gives back its tree AND its ref. The two are reclaimed separately: a
+// run whose tree was removed by hand (or never pinned) still holds a ref that pins its commits.
+export function pruneOld(main, warnings) {
   const root = join(main, '.ghost', 'validations');
   if (!existsSync(root)) return;
   const dayAgo = Date.now() - 24 * 3600 * 1000;
+  const refs = new Set(git(main, 'for-each-ref', '--format=%(refname:lstrip=2)', 'refs/ghost-validate').split('\n').filter(Boolean));
   for (const name of readdirSync(root)) {
     const run = join(root, name);
     const tree = join(run, 'tree');
-    if (!existsSync(tree)) continue;
+    const hasTree = existsSync(tree);
+    const hasRef = refs.has(name);
+    if (!hasTree && !hasRef) continue;
     const st = readJSON(join(run, 'state.json'), {});
     const old = statSync(run).mtimeMs < dayAgo;
     if (!st.finished_at && !old) continue;
     try {
-      git(main, 'worktree', 'remove', '--force', tree);
-      git(main, 'update-ref', '-d', `refs/ghost-validate/${name}`);
+      if (hasTree) git(main, 'worktree', 'remove', '--force', tree);
+      if (hasRef) git(main, 'update-ref', '-d', `refs/ghost-validate/${name}`);
     } catch (e) {
-      warnings.push(`could not remove the old validation tree ${tree}: ${String(e.message || e).split('\n')[0]}`);
+      warnings.push(`could not clean up the old validation run ${name}: ${String(e.message || e).split('\n')[0]}`);
     }
   }
 }
