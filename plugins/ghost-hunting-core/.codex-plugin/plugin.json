@@ -1,6 +1,6 @@
 {
   "name": "ghost-hunting-core",
-  "version": "1.12.2",
+  "version": "1.12.3",
   "description": "Shared Ghost Hunting skills and native Codex workflow execution",
   "author": {
     "name": "Justin Weilbach",

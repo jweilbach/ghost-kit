@@ -92,7 +92,7 @@ case "$KEY_SRC" in "$REPO_ROOT"/*) KEY_SHOW="./${KEY_SRC#"$REPO_ROOT"/}" ;; "$HO
 # scripts/ghost-kit-release.sh. Deliberately NOT read from disk: a session loads skill
 # text once at start and holds it, so a runtime read reports what is on disk NOW, not
 # what is running. That is how a session executing v1.3.7 reported plugin/1.4.0.
-PLUGIN_VERSION="1.12.2"
+PLUGIN_VERSION="1.12.3"
 GK_ROOT="${GHOST_KIT_ROOT:-${CLAUDE_PLUGIN_ROOT:-${PLUGIN_ROOT:-}}}"
 [ -z "$GK_ROOT" ] && [ -x "$REPO_ROOT/.ghost/bin/resolve-plugin" ] && GK_ROOT=$("$REPO_ROOT/.ghost/bin/resolve-plugin" 2>/dev/null)
 GK_SRC=$(jq -r '.["ghost-kit"].installLocation // empty' "$HOME/.claude/plugins/known_marketplaces.json" 2>/dev/null)
@@ -314,6 +314,8 @@ curl -s -X POST "$API_BASE/api/agent/hauntings/{HAUNTING_ID}/ghosts" \
 ```
 
 `milestone_id` in the create payload attaches the rite in the same call — no follow-up needed. (Hauntings may carry a `default_milestone_id`; new ghosts auto-inherit it when you send none.)
+
+**A full MM/DD cap (409 `MMDD_CAPACITY_FULL`).** A Rite's target date is the MM/DD of its ghosts, so filing into a *dated* rite commits a date, and a Coven may cap its open MM/DDs. If the create returns 409 with `detail.code == "MMDD_CAPACITY_FULL"`, nothing was created. Tell the user in one line, using `detail.message`: the Coven is at its cap (`detail.committed`/`detail.cap`). Offer to create the ghost **without** the rite instead; it is then logged with no date. Never drop someone else's commitment to make room yourself. That trade-off belongs to a human on the Prioritization page. (A haunting's dated default rite is skipped automatically at the cap, and the response says `default_rite_skipped: true`. Mention it if you see it.)
 
 Record the returned ghost ID.
 
